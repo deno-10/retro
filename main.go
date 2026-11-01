@@ -12,6 +12,7 @@ import (
 	"flag"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -59,6 +60,9 @@ func main() {
 
 	go func() {
 		logger.Info("retro запущен", "addr", *addr, "data", *dataFile)
+		for _, u := range shareURLs(*addr, lanIPs()) {
+			logger.Info("ссылка для команды", "url", u)
+		}
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("сервер остановлен с ошибкой", "err", err)
 			stop()
@@ -73,6 +77,52 @@ func main() {
 		logger.Error("остановка с ошибкой", "err", err)
 	}
 	logger.Info("retro остановлен")
+}
+
+// shareURLs — адреса, по которым команда откроет доску. Если сервер слушает
+// все интерфейсы (":8080" или "0.0.0.0:8080"), подставляются адреса машины
+// в локальной сети, чтобы ссылку можно было сразу скинуть коллегам.
+func shareURLs(addr string, ips []net.IP) []string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil
+	}
+	if host != "" && host != "0.0.0.0" && host != "::" {
+		return []string{"http://" + net.JoinHostPort(host, port)}
+	}
+	urls := []string{"http://localhost:" + port}
+	for _, ip := range ips {
+		urls = append(urls, "http://"+net.JoinHostPort(ip.String(), port))
+	}
+	return urls
+}
+
+// lanIPs — IPv4-адреса машины на поднятых интерфейсах, кроме loopback.
+func lanIPs() []net.IP {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var ips []net.IP
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ip4 := ipn.IP.To4(); ip4 != nil && !ip4.IsLoopback() && !ip4.IsLinkLocalUnicast() {
+				ips = append(ips, ip4)
+			}
+		}
+	}
+	return ips
 }
 
 // openStore открывает хранилище по пути. Для SQLite при пустой базе один раз
