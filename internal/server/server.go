@@ -47,6 +47,8 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handle
 	m.HandleFunc("PATCH /api/boards/{id}/cards/{cardId}", s.handleEditCard)
 	m.HandleFunc("DELETE /api/boards/{id}/cards/{cardId}", s.handleDeleteCard)
 	m.HandleFunc("POST /api/boards/{id}/cards/{cardId}/vote", s.handleVote)
+	m.HandleFunc("POST /api/boards/{id}/cards/{cardId}/group", s.handleGroupCard)
+	m.HandleFunc("DELETE /api/boards/{id}/cards/{cardId}/group", s.handleUngroupCard)
 	m.HandleFunc("POST /api/boards/{id}/actions", s.handleAddAction)
 	m.HandleFunc("PATCH /api/boards/{id}/actions/{actionId}", s.handleEditAction)
 	m.HandleFunc("DELETE /api/boards/{id}/actions/{actionId}", s.handleDeleteAction)
@@ -245,6 +247,27 @@ func (s *Server) handleSetVoteLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mutate(w, r, func(b *model.Board, pid string) error {
 		return b.SetVoteLimit(in.VoteLimit, pid)
+	})
+}
+
+func (s *Server) handleGroupCard(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		TargetCardID string `json:"targetCardId"`
+	}
+	if err := decode(w, r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	cardID := r.PathValue("cardId")
+	s.mutate(w, r, func(b *model.Board, pid string) error {
+		return b.GroupCards(cardID, in.TargetCardID, pid)
+	})
+}
+
+func (s *Server) handleUngroupCard(w http.ResponseWriter, r *http.Request) {
+	cardID := r.PathValue("cardId")
+	s.mutate(w, r, func(b *model.Board, pid string) error {
+		return b.UngroupCard(cardID, pid)
 	})
 }
 

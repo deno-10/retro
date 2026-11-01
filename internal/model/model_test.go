@@ -157,6 +157,97 @@ func TestDiscussSortsByVotes(t *testing.T) {
 	}
 }
 
+func TestGrouping(t *testing.T) {
+	b := newTestBoard(t)
+	col := b.Columns[0].ID
+	var ids []string
+	for _, text := range []string{"a", "b", "c", "d"} {
+		c, err := b.AddCard(col, text, "", "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, c.ID)
+	}
+	if err := b.GroupCards(ids[0], ids[1], "owner-1"); err != ErrPhase {
+		t.Fatalf("в фазе записи группировать нельзя: %v", err)
+	}
+	if err := b.SetPhase(PhaseReveal, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.GroupCards(ids[0], ids[1], "alice"); err != ErrForbidden {
+		t.Fatalf("группирует только ведущий: %v", err)
+	}
+	if err := b.GroupCards(ids[0], ids[0], "owner-1"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("карточка с самой собой: %v", err)
+	}
+	other, _ := b.AddCard(b.Columns[1].ID, "в другой колонке", "", "alice")
+	if err := b.GroupCards(ids[0], other.ID, "owner-1"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("между колонками группировать нельзя: %v", err)
+	}
+
+	// a → c: новая группа из a и c; затем b → в неё же.
+	if err := b.GroupCards(ids[0], ids[2], "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.GroupCards(ids[1], ids[0], "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	cards := b.View("bob").Columns[0].Cards
+	gid := cards[0].GroupID
+	if gid == "" || cards[1].GroupID != gid || cards[2].GroupID != gid || cards[3].GroupID != "" {
+		t.Fatalf("группа должна идти подряд на месте первой карточки: %+v", cards)
+	}
+	if cards[0].ID != ids[0] || cards[1].ID != ids[1] || cards[2].ID != ids[2] {
+		t.Fatalf("порядок внутри группы должен сохраняться: %+v", cards)
+	}
+
+	// Голос за группу один: ставится на одну карточку, снимается с любой.
+	if err := b.SetPhase(PhaseVote, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ToggleVote(ids[2], "bob"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ToggleVote(ids[3], "carol"); err != nil {
+		t.Fatal(err)
+	}
+	v := b.View("bob").Columns[0].Cards
+	if v[0].GroupVotes != 1 || !v[0].GroupVoted || v[2].Votes != 1 {
+		t.Fatalf("голоса группы должны суммироваться: %+v", v)
+	}
+	if voted, err := b.ToggleVote(ids[0], "bob"); err != nil || voted {
+		t.Fatalf("повторный голос за группу через другую карточку должен снимать: voted=%v err=%v", voted, err)
+	}
+	if b.View("bob").Columns[0].Cards[0].GroupVotes != 0 {
+		t.Fatal("голос должен быть снят с группы")
+	}
+
+	// В обсуждении одиночная d с одним голосом идёт раньше группы без голосов.
+	if err := b.SetPhase(PhaseDiscuss, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	v = b.View("bob").Columns[0].Cards
+	if v[0].ID != ids[3] || v[1].GroupID != gid || v[3].GroupID != gid {
+		t.Fatalf("сортировка по голосам должна держать группу вместе: %+v", v)
+	}
+	if md := b.Markdown(); !containsAll(md, "- d (1 голос)", "- a\n  - b\n  - c") {
+		t.Fatalf("группа в markdown — вложенный список:\n%s", md)
+	}
+
+	// Выход из группы и роспуск группы из одной карточки.
+	if err := b.UngroupCard(ids[1], "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.DeleteCard(ids[0], "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range b.Columns[0].Cards {
+		if c.GroupID != "" {
+			t.Fatalf("после удаления в группе осталась одна карточка — группа должна распасться: %+v", c)
+		}
+	}
+}
+
 func TestActions(t *testing.T) {
 	b := newTestBoard(t)
 	if _, err := b.AddAction("рано", "", "alice"); err != ErrPhase {

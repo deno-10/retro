@@ -260,6 +260,16 @@ function renderBoardPage(root, id) {
     catch (err) { toast(err.message); }
   }
 
+  async function groupCards(cardId, targetId) {
+    try { await api('POST', `/api/boards/${board.id}/cards/${cardId}/group`, { targetCardId: targetId }); }
+    catch (err) { toast(err.message); }
+  }
+
+  async function ungroupCard(cardId) {
+    try { await api('DELETE', `/api/boards/${board.id}/cards/${cardId}/group`); }
+    catch (err) { toast(err.message); }
+  }
+
   async function toggleActionDone(actionId) {
     try { await api('POST', `/api/boards/${board.id}/actions/${actionId}/done`); }
     catch (err) { toast(err.message); }
@@ -370,6 +380,9 @@ function renderBoardPage(root, id) {
     if (board.phase === 'vote') {
       hint = `Отметьте самое важное — по одному голосу на карточку, всего ${board.voteLimit}.`;
     }
+    if (board.phase === 'reveal' && board.isOwner) {
+      hint += ' Перетащите карточку на другую, чтобы объединить похожие.';
+    }
     hintEl.textContent = hint;
   }
 
@@ -432,7 +445,7 @@ function renderBoardPage(root, id) {
       return h('section', { class: 'column' },
         h('header', { class: 'column-head' }, h('h2', {}, col.title), h('span', { class: 'count' }, String(col.cards.length))),
         empty,
-        h('ul', { class: 'cards' }, col.cards.map(renderCard)),
+        renderCardList(col),
         canWrite() ? renderComposer(col) : null,
       );
     });
@@ -595,7 +608,93 @@ function renderBoardPage(root, id) {
     return h('div', { class: 'composer' }, ta, btn);
   }
 
-  function renderCard(card) {
+  // --- группы и перетаскивание ---
+
+  // Группирует только ведущий, и только когда карточки видны всем.
+  function canGroup() {
+    return board.isOwner && board.phase !== 'write';
+  }
+
+  // Карточки одной группы приходят с сервера подряд, поэтому группу можно
+  // собрать за один проход по списку.
+  function renderCardList(col) {
+    const items = [];
+    for (let i = 0; i < col.cards.length;) {
+      const card = col.cards[i];
+      if (!card.groupId) {
+        items.push(renderCard(card, false));
+        i++;
+        continue;
+      }
+      const members = [];
+      while (i < col.cards.length && col.cards[i].groupId === card.groupId) members.push(col.cards[i++]);
+      items.push(renderGroup(members));
+    }
+    return h('ul', { class: 'cards' }, items);
+  }
+
+  function voteControl(voted, count, cardId) {
+    if (board.phase === 'vote') {
+      return h('button', {
+        type: 'button', class: 'vote' + (voted ? ' voted' : ''),
+        'aria-pressed': voted ? 'true' : 'false',
+        title: voted ? 'Снять голос' : 'Отдать голос',
+        onclick: () => vote(cardId),
+      }, h('i', { class: 'dot' }), String(count));
+    }
+    if (board.phase === 'discuss') {
+      return h('span', { class: 'vote static' }, h('i', { class: 'dot' }), String(count));
+    }
+    return null;
+  }
+
+  function renderGroup(members) {
+    const head = members[0];
+    const el = h('li', { class: 'group', 'aria-label': `Группа из ${members.length} карточек` },
+      h('ul', { class: 'cards' }, members.map(c => renderCard(c, true))),
+      h('div', { class: 'group-foot' },
+        h('span', { class: 'meta' }, `Группа · ${members.length}`),
+        h('span', { class: 'card-actions' }, voteControl(head.groupVoted, head.groupVotes, head.id))));
+    attachDrop(el, head.id);
+    return el;
+  }
+
+  let dragging = null; // id перетаскиваемой карточки
+
+  function attachDrag(el, cardId) {
+    if (!canGroup()) return;
+    el.draggable = true;
+    el.addEventListener('dragstart', e => {
+      dragging = cardId;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', cardId);
+      el.classList.add('dragging');
+    });
+    el.addEventListener('dragend', () => {
+      dragging = null;
+      el.classList.remove('dragging');
+    });
+  }
+
+  function attachDrop(el, targetId) {
+    if (!canGroup()) return;
+    el.addEventListener('dragover', e => {
+      if (!dragging || dragging === targetId) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      el.classList.add('drop-target');
+    });
+    el.addEventListener('dragleave', () => el.classList.remove('drop-target'));
+    el.addEventListener('drop', e => {
+      e.preventDefault();
+      e.stopPropagation(); // карточка внутри группы: не отдавать событие группе
+      el.classList.remove('drop-target');
+      const id = dragging || e.dataTransfer.getData('text/plain');
+      if (id && id !== targetId) groupCards(id, targetId);
+    });
+  }
+
+  function renderCard(card, inGroup) {
     if (card.hidden) {
       return h('li', { class: 'card hidden', 'aria-label': 'Скрытая карточка другого участника' });
     }
@@ -603,21 +702,14 @@ function renderBoardPage(root, id) {
 
     const editable = canWrite() && (card.mine || board.isOwner);
     const deletable = (card.mine && canWrite()) || board.isOwner;
-    const showVotes = board.phase === 'vote' || board.phase === 'discuss';
 
     const meta = [h('span', { class: 'author' }, card.author || 'анонимно')];
     if (card.mine) meta.push(h('span', { class: 'mine-badge' }, 'ваша'));
 
     const actions = [];
-    if (showVotes && board.phase === 'vote') {
-      actions.push(h('button', {
-        type: 'button', class: 'vote' + (card.voted ? ' voted' : ''),
-        'aria-pressed': card.voted ? 'true' : 'false',
-        title: card.voted ? 'Снять голос' : 'Отдать голос',
-        onclick: () => vote(card.id),
-      }, h('i', { class: 'dot' }), String(card.votes)));
-    } else if (showVotes) {
-      actions.push(h('span', { class: 'vote static' }, h('i', { class: 'dot' }), String(card.votes)));
+    if (!inGroup) actions.push(voteControl(card.voted, card.votes, card.id));
+    if (inGroup && canGroup()) {
+      actions.push(h('button', { type: 'button', class: 'link', onclick: () => ungroupCard(card.id) }, 'Из группы'));
     }
     if (editable) {
       actions.push(h('button', { type: 'button', class: 'link', onclick: () => { editingId = card.id; render(); } }, 'Изменить'));
@@ -626,11 +718,14 @@ function renderBoardPage(root, id) {
       actions.push(h('button', { type: 'button', class: 'link danger', onclick: () => removeCard(card) }, 'Удалить'));
     }
 
-    return h('li', { class: 'card' + (card.mine ? ' mine' : '') },
+    const el = h('li', { class: 'card' + (card.mine ? ' mine' : '') },
       h('p', { class: 'text' }, card.text),
       h('div', { class: 'card-foot' },
         h('span', { class: 'meta' }, meta),
         h('span', { class: 'card-actions' }, actions)));
+    attachDrag(el, card.id);
+    attachDrop(el, card.id);
+    return el;
   }
 
   function renderCardEditor(card) {

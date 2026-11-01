@@ -109,6 +109,46 @@ func TestBoardFlow(t *testing.T) {
 	}
 }
 
+func TestGroupEndpoints(t *testing.T) {
+	h := newTestServer(t)
+	const owner, alice = "owner-00000001", "alice-00000001"
+
+	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Группы", "template": "classic"})
+	id := out["id"].(string)
+	colID := out["columns"].([]any)[0].(map[string]any)["id"].(string)
+	var ids []string
+	for _, text := range []string{"первая", "вторая"} {
+		_, out = do(t, h, "POST", "/api/boards/"+id+"/cards", alice, map[string]any{"columnId": colID, "text": text})
+		cards := out["columns"].([]any)[0].(map[string]any)["cards"].([]any)
+		ids = append(ids, cards[len(cards)-1].(map[string]any)["id"].(string))
+	}
+	if rec, _ := do(t, h, "POST", "/api/boards/"+id+"/cards/"+ids[0]+"/group", owner, map[string]any{"targetCardId": ids[1]}); rec.Code != http.StatusConflict {
+		t.Fatalf("группировка в фазе записи: %d", rec.Code)
+	}
+	do(t, h, "POST", "/api/boards/"+id+"/phase", owner, map[string]any{"phase": "reveal"})
+	if rec, _ := do(t, h, "POST", "/api/boards/"+id+"/cards/"+ids[0]+"/group", alice, map[string]any{"targetCardId": ids[1]}); rec.Code != http.StatusForbidden {
+		t.Fatalf("группировка не ведущим: %d", rec.Code)
+	}
+	rec, out := do(t, h, "POST", "/api/boards/"+id+"/cards/"+ids[0]+"/group", owner, map[string]any{"targetCardId": ids[1]})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("группировка: %d %s", rec.Code, rec.Body)
+	}
+	cards := out["columns"].([]any)[0].(map[string]any)["cards"].([]any)
+	g0, g1 := cards[0].(map[string]any)["groupId"], cards[1].(map[string]any)["groupId"]
+	if g0 == nil || g0 != g1 {
+		t.Fatalf("обе карточки должны быть в одной группе: %v", cards)
+	}
+	rec, out = do(t, h, "DELETE", "/api/boards/"+id+"/cards/"+ids[0]+"/group", owner, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("разгруппировка: %d %s", rec.Code, rec.Body)
+	}
+	for _, c := range out["columns"].([]any)[0].(map[string]any)["cards"].([]any) {
+		if c.(map[string]any)["groupId"] != nil {
+			t.Fatalf("после выхода одной из двух карточек группа должна распасться: %v", c)
+		}
+	}
+}
+
 func TestActionsFlow(t *testing.T) {
 	h := newTestServer(t)
 	const owner, alice, bob = "owner-00000001", "alice-00000001", "bob-0000000001"

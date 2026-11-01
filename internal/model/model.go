@@ -94,9 +94,10 @@ type Column struct {
 type Card struct {
 	ID        string    `json:"id"`
 	Text      string    `json:"text"`
-	Author    string    `json:"author"`   // подпись; пустая — анонимно
-	AuthorID  string    `json:"authorId"` // идентификатор участника
-	Votes     []string  `json:"votes"`    // идентификаторы проголосовавших
+	Author    string    `json:"author"`            // подпись; пустая — анонимно
+	AuthorID  string    `json:"authorId"`          // идентификатор участника
+	Votes     []string  `json:"votes"`             // идентификаторы проголосовавших
+	GroupID   string    `json:"groupId,omitempty"` // карточки с одним GroupID склеены в группу
 	CreatedAt time.Time `json:"createdAt"`
 }
 
@@ -263,12 +264,89 @@ func (b *Board) DeleteCard(cardID, actorID string) error {
 	if err := b.canEdit(c, actorID); err != nil {
 		return err
 	}
+	group := c.GroupID
 	for i := range col.Cards {
 		if col.Cards[i].ID == cardID {
 			col.Cards = append(col.Cards[:i], col.Cards[i+1:]...)
-			return nil
+			break
 		}
 	}
+	dissolveIfSingle(col, group)
+	return nil
+}
+
+// dissolveIfSingle снимает группу, в которой осталась одна карточка:
+// группа из одной карточки — просто карточка.
+func dissolveIfSingle(col *Column, groupID string) {
+	if groupID == "" {
+		return
+	}
+	var only *Card
+	n := 0
+	for i := range col.Cards {
+		if col.Cards[i].GroupID == groupID {
+			n++
+			only = &col.Cards[i]
+		}
+	}
+	if n == 1 {
+		only.GroupID = ""
+	}
+}
+
+// canGroup: группирует только ведущий и только когда карточки видны всем.
+func (b *Board) canGroup(actorID string) error {
+	if actorID != b.OwnerID {
+		return ErrForbidden
+	}
+	if b.Phase == PhaseWrite {
+		return ErrPhase
+	}
+	return nil
+}
+
+// GroupCards присоединяет карточку cardID к карточке targetID: если цель уже
+// в группе — к её группе, иначе из двух карточек создаётся новая группа.
+// Карточки должны быть в одной колонке.
+func (b *Board) GroupCards(cardID, targetID, actorID string) error {
+	if err := b.canGroup(actorID); err != nil {
+		return err
+	}
+	if cardID == targetID {
+		return fmt.Errorf("%w: карточку нельзя сгруппировать с самой собой", ErrInvalid)
+	}
+	col, c := b.findCard(cardID)
+	tcol, t := b.findCard(targetID)
+	if c == nil || t == nil {
+		return fmt.Errorf("%w: карточка не найдена", ErrNotFound)
+	}
+	if col != tcol {
+		return fmt.Errorf("%w: группировать можно только в пределах колонки", ErrInvalid)
+	}
+	if c.GroupID != "" && c.GroupID == t.GroupID {
+		return nil // уже вместе
+	}
+	old := c.GroupID
+	if t.GroupID == "" {
+		t.GroupID = NewID()
+	}
+	c.GroupID = t.GroupID
+	dissolveIfSingle(col, old)
+	return nil
+}
+
+// UngroupCard вынимает карточку из группы.
+func (b *Board) UngroupCard(cardID, actorID string) error {
+	if err := b.canGroup(actorID); err != nil {
+		return err
+	}
+	col, c := b.findCard(cardID)
+	if c == nil {
+		return fmt.Errorf("%w: карточка не найдена", ErrNotFound)
+	}
+	old := c.GroupID
+	c.GroupID = ""
+	dissolveIfSingle(col, old)
 	return nil
 }
 
@@ -293,14 +371,27 @@ func (b *Board) ToggleVote(cardID, participantID string) (bool, error) {
 	if b.Phase != PhaseVote {
 		return false, ErrPhase
 	}
-	_, c := b.findCard(cardID)
+	col, c := b.findCard(cardID)
 	if c == nil {
 		return false, fmt.Errorf("%w: карточка не найдена", ErrNotFound)
 	}
-	for i, v := range c.Votes {
-		if v == participantID {
-			c.Votes = append(c.Votes[:i], c.Votes[i+1:]...)
-			return false, nil
+	// За группу голосуют как за одну карточку: если голос участника уже
+	// стоит на любой карточке группы, повторный клик его снимает.
+	members := []*Card{c}
+	if c.GroupID != "" {
+		members = members[:0]
+		for i := range col.Cards {
+			if col.Cards[i].GroupID == c.GroupID {
+				members = append(members, &col.Cards[i])
+			}
+		}
+	}
+	for _, m := range members {
+		for i, v := range m.Votes {
+			if v == participantID {
+				m.Votes = append(m.Votes[:i], m.Votes[i+1:]...)
+				return false, nil
+			}
 		}
 	}
 	if b.VotesUsed(participantID) >= b.VoteLimit {
@@ -308,6 +399,75 @@ func (b *Board) ToggleVote(cardID, participantID string) (bool, error) {
 	}
 	c.Votes = append(c.Votes, participantID)
 	return true, nil
+}
+
+// groupVotes — сумма голосов карточек группы.
+func groupVotes(col Column, groupID string) int {
+	n := 0
+	for _, c := range col.Cards {
+		if c.GroupID == groupID {
+			n += len(c.Votes)
+		}
+	}
+	return n
+}
+
+// groupVoted — голосовал ли участник за какую-либо карточку группы.
+func groupVoted(col Column, groupID, participantID string) bool {
+	for _, c := range col.Cards {
+		if c.GroupID != groupID {
+			continue
+		}
+		for _, v := range c.Votes {
+			if v == participantID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// arrange возвращает карточки колонки так, чтобы карточки одной группы шли
+// подряд на месте первой из них. При byVotes порядок — по убыванию голосов
+// группы (для одиночной карточки — её голосов), при равенстве исходный.
+func arrange(col Column, byVotes bool) []Card {
+	anchor := map[string]int{} // группа → индекс её первой карточки
+	for i, c := range col.Cards {
+		if c.GroupID != "" {
+			if _, ok := anchor[c.GroupID]; !ok {
+				anchor[c.GroupID] = i
+			}
+		}
+	}
+	pos := func(i int) int {
+		if g := col.Cards[i].GroupID; g != "" {
+			return anchor[g]
+		}
+		return i
+	}
+	weight := func(i int) int {
+		if g := col.Cards[i].GroupID; g != "" {
+			return groupVotes(col, g)
+		}
+		return len(col.Cards[i].Votes)
+	}
+	idx := make([]int, len(col.Cards))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		if byVotes {
+			if wa, wb := weight(idx[a]), weight(idx[b]); wa != wb {
+				return wa > wb
+			}
+		}
+		return pos(idx[a]) < pos(idx[b])
+	})
+	out := make([]Card, len(idx))
+	for i, j := range idx {
+		out[i] = col.Cards[j]
+	}
+	return out
 }
 
 // SetPhase переводит доску в фазу. Только ведущий; в любом направлении.
@@ -488,6 +648,11 @@ type CardView struct {
 	Hidden bool   `json:"hidden"`
 	Votes  int    `json:"votes"`
 	Voted  bool   `json:"voted"`
+	// Группа: карточки с одним groupId идут в списке подряд. GroupVotes и
+	// GroupVoted — по группе целиком, за неё голосуют как за одну карточку.
+	GroupID    string `json:"groupId,omitempty"`
+	GroupVotes int    `json:"groupVotes"`
+	GroupVoted bool   `json:"groupVoted"`
 }
 
 // ActionView — решение в представлении участника.
@@ -518,8 +683,8 @@ func (b *Board) View(viewer string) BoardView {
 	}
 	for _, col := range b.Columns {
 		cv := ColumnView{ID: col.ID, Title: col.Title, Cards: make([]CardView, 0, len(col.Cards))}
-		for _, c := range col.Cards {
-			card := CardView{ID: c.ID, Mine: c.AuthorID == viewer}
+		for _, c := range arrange(col, b.Phase == PhaseDiscuss) {
+			card := CardView{ID: c.ID, Mine: c.AuthorID == viewer, GroupID: c.GroupID}
 			if b.Phase == PhaseWrite && !card.Mine {
 				card.Hidden = true
 			} else {
@@ -534,11 +699,12 @@ func (b *Board) View(viewer string) BoardView {
 						break
 					}
 				}
+				if c.GroupID != "" {
+					card.GroupVotes = groupVotes(col, c.GroupID)
+					card.GroupVoted = groupVoted(col, c.GroupID, viewer)
+				}
 			}
 			cv.Cards = append(cv.Cards, card)
-		}
-		if b.Phase == PhaseDiscuss {
-			sort.SliceStable(cv.Cards, func(i, j int) bool { return cv.Cards[i].Votes > cv.Cards[j].Votes })
 		}
 		v.Columns = append(v.Columns, cv)
 	}
@@ -558,20 +724,33 @@ func (b *Board) Markdown() string {
 	fmt.Fprintf(&sb, "%s\n\n", b.CreatedAt.Format("02.01.2006"))
 	for _, col := range b.Columns {
 		fmt.Fprintf(&sb, "## %s\n\n", col.Title)
-		cards := append([]Card(nil), col.Cards...)
-		sort.SliceStable(cards, func(i, j int) bool { return len(cards[i].Votes) > len(cards[j].Votes) })
+		cards := arrange(col, true)
 		if len(cards) == 0 {
 			sb.WriteString("_пусто_\n\n")
 			continue
 		}
+		// Группа — вложенный список: первая карточка с суммой голосов группы,
+		// остальные под ней без голосов.
+		seen := map[string]bool{}
 		for _, c := range cards {
-			text := strings.ReplaceAll(strings.TrimSpace(c.Text), "\n", "\n  ")
-			fmt.Fprintf(&sb, "- %s", text)
+			indent := ""
+			votes := len(c.Votes)
+			if c.GroupID != "" {
+				if seen[c.GroupID] {
+					indent = "  "
+					votes = 0
+				} else {
+					seen[c.GroupID] = true
+					votes = groupVotes(col, c.GroupID)
+				}
+			}
+			text := strings.ReplaceAll(strings.TrimSpace(c.Text), "\n", "\n"+indent+"  ")
+			fmt.Fprintf(&sb, "%s- %s", indent, text)
 			if c.Author != "" {
 				fmt.Fprintf(&sb, " — %s", c.Author)
 			}
-			if n := len(c.Votes); n > 0 {
-				fmt.Fprintf(&sb, " (%d %s)", n, plural(n, "голос", "голоса", "голосов"))
+			if votes > 0 {
+				fmt.Fprintf(&sb, " (%d %s)", votes, plural(votes, "голос", "голоса", "голосов"))
 			}
 			sb.WriteString("\n")
 		}
