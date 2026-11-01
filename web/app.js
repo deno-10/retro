@@ -170,18 +170,31 @@ async function renderHome(root) {
       }
     },
   },
-    h('h1', {}, 'Ретро спринта'),
-    h('p', { class: 'lead' }, 'Создайте доску и отправьте команде ссылку. Регистрация не нужна.'),
+    h('h2', {}, 'Новая доска'),
     h('label', {}, 'Название', titleInput),
     h('label', {}, 'Шаблон', select),
     h('label', {}, 'Ваше имя', nameInput),
     submit,
   );
-  root.replaceChildren(form);
+
+  const hero = h('section', { class: 'hero' },
+    h('span', { class: 'eyebrow' }, 'Ретроспектива спринта'),
+    h('h1', {}, 'Обсудите спринт ', h('em', {}, 'честно'), ' и решите, что менять'),
+    h('p', { class: 'lead' }, 'Создайте доску и отправьте команде ссылку. Без регистрации, изменения видны всем сразу.'),
+    h('ul', { class: 'features', 'aria-label': 'Что умеет' },
+      h('li', {}, 'Скрытые карточки до показа'),
+      h('li', {}, 'Голосование точками'),
+      h('li', {}, 'Группировка и решения'),
+      h('li', {}, 'Экспорт в Markdown'),
+    ),
+  );
+
+  const page = h('div', { class: 'home-page' }, hero, form);
+  root.replaceChildren(page);
 
   const recent = recentBoards();
   if (recent.length) {
-    root.append(h('section', { class: 'recent' },
+    page.append(h('section', { class: 'recent' },
       h('h2', {}, 'Недавние доски'),
       h('ul', {}, recent.map(b => h('li', {},
         h('a', { href: '/b/' + b.id }, b.title || 'Без названия'),

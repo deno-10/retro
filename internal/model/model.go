@@ -116,7 +116,7 @@ type Template struct {
 
 // Templates — доступные шаблоны.
 var Templates = []Template{
-	{ID: "classic", Name: "Классика", Columns: []string{"Что было хорошо", "Что улучшить", "Что сделать"}},
+	{ID: "classic", Name: "Классика", Columns: []string{"Что понравилось", "Что не понравилось", "Что улучшить"}},
 	{ID: "ssc", Name: "Start / Stop / Continue", Columns: []string{"Начать", "Перестать", "Продолжать"}},
 	{ID: "4l", Name: "4L", Columns: []string{"Понравилось", "Узнали", "Не хватало", "Хотелось бы"}},
 	{ID: "msg", Name: "Mad / Sad / Glad", Columns: []string{"Злит", "Огорчает", "Радует"}},

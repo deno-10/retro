@@ -152,7 +152,7 @@ func TestDiscussSortsByVotes(t *testing.T) {
 	if cards[0].ID != secondID || cards[0].Votes != 2 {
 		t.Fatalf("первой должна идти карточка с 2 голосами: %+v", cards)
 	}
-	if md := b.Markdown(); !containsAll(md, "## Что было хорошо", "- вторая (2 голоса)", "- первая (1 голос)") {
+	if md := b.Markdown(); !containsAll(md, "## Что понравилось", "- вторая (2 голоса)", "- первая (1 голос)") {
 		t.Fatalf("неожиданный markdown:\n%s", md)
 	}
 }
