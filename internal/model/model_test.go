@@ -157,6 +157,66 @@ func TestDiscussSortsByVotes(t *testing.T) {
 	}
 }
 
+func TestNextBoard(t *testing.T) {
+	b := newTestBoard(t)
+	if err := b.SetPhase(PhaseDiscuss, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	open, err := b.AddAction("Настроить алерты", "Боб", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	openID := open.ID
+	closed, err := b.AddAction("Уже сделано", "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ToggleActionDone(closed.ID, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetVoteLimit(7, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := b.NextBoard("", "alice"); err != ErrForbidden {
+		t.Fatalf("следующее ретро создаёт только ведущий: %v", err)
+	}
+	next, err := b.NextBoard("", "owner-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Title != b.Title || next.Template != b.Template || next.OwnerID != b.OwnerID || next.VoteLimit != 7 {
+		t.Fatalf("следующее ретро должно наследовать название, шаблон, ведущего и лимит: %+v", next)
+	}
+	if next.PrevID != b.ID || next.Phase != PhaseWrite {
+		t.Fatalf("ссылка на предыдущее и фаза записи: %+v", next)
+	}
+	if len(next.Actions) != 1 || next.Actions[0].Text != "Настроить алерты" || next.Actions[0].Assignee != "Боб" {
+		t.Fatalf("переноситься должно только незакрытое решение: %+v", next.Actions)
+	}
+	carried := next.Actions[0]
+	if carried.CarriedFrom != b.ID || carried.ID == openID || carried.Done || carried.AuthorID != "alice" {
+		t.Fatalf("перенесённое решение: новый id, пометка откуда, автор сохранён: %+v", carried)
+	}
+	if v := next.View("alice"); !v.Actions[0].Carried || !v.Actions[0].Mine || v.PrevID != b.ID {
+		t.Fatalf("представление следующего ретро: %+v", v)
+	}
+	if md := next.Markdown(); !containsAll(md, "- [ ] Настроить алерты — Боб (перенесено)") {
+		t.Fatalf("пометка о переносе в markdown:\n%s", md)
+	}
+
+	b.NextID = next.ID
+	if _, err := b.NextBoard("ещё одно", "owner-1"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("второе следующее ретро создать нельзя: %v", err)
+	}
+	if v := b.View("bob"); v.NextID != next.ID {
+		t.Fatalf("ссылка на следующее в представлении: %+v", v)
+	}
+	if titled, err := b.NextBoard("Спринт 2", "owner-1"); err == nil || titled != nil {
+		t.Fatal("после установки NextID создание должно падать")
+	}
+}
+
 func TestGrouping(t *testing.T) {
 	b := newTestBoard(t)
 	col := b.Columns[0].ID

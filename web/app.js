@@ -211,6 +211,7 @@ function renderBoardPage(root, id) {
   const actionDraft = { text: '', assignee: '' };
 
   const titleEl = h('h1', { class: 'board-title' });
+  const chainEl = h('nav', { class: 'chain', 'aria-label': 'Ретро этой команды' });
   const phaseNav = h('nav', { class: 'phases', 'aria-label': 'Фазы ретро' });
   const toolsEl = h('div', { class: 'tools' });
   const hintEl = h('p', { class: 'hint' });
@@ -224,7 +225,7 @@ function renderBoardPage(root, id) {
       phaseNav,
       toolsEl,
     ),
-    h('div', { class: 'statusline' }, hintEl, timerEl, statusEl),
+    h('div', { class: 'statusline' }, hintEl, timerEl, statusEl, chainEl),
     columnsEl,
   );
 
@@ -293,6 +294,20 @@ function renderBoardPage(root, id) {
     catch (err) { toast(err.message); }
   }
 
+  // Следующее ретро: та же команда, тот же шаблон, незакрытые решения
+  // переезжают. После создания переходим на новую доску.
+  async function createNextBoard() {
+    const title = prompt('Название следующего ретро', board.title);
+    if (title === null) return;
+    try {
+      const next = await api('POST', `/api/boards/${board.id}/next`, { title });
+      rememberBoard(next.id, next.title);
+      location.href = '/b/' + next.id;
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
   async function copyLink() {
     const url = location.origin + '/b/' + board.id;
     try {
@@ -320,6 +335,7 @@ function renderBoardPage(root, id) {
     const saved = captureFocus();
     const scrollLeft = columnsEl.scrollLeft;
     renderPhases();
+    renderChain();
     renderTools();
     renderTimer();
     renderColumns();
@@ -386,6 +402,42 @@ function renderBoardPage(root, id) {
     hintEl.textContent = hint;
   }
 
+  // Цепочка ретро: ссылки на предыдущее и следующее и выпадающая история.
+  // История грузится при открытии, а не с каждым событием доски.
+  function renderChain() {
+    if (!board.prevId && !board.nextId) {
+      chainEl.replaceChildren();
+      return;
+    }
+    const list = h('ol', { class: 'history' });
+    const details = h('details', { class: 'history-box' },
+      h('summary', {}, 'История'),
+      list);
+    details.addEventListener('toggle', async () => {
+      if (!details.open) return;
+      list.replaceChildren(h('li', { class: 'muted' }, 'Загрузка…'));
+      try {
+        const chain = await api('GET', `/api/boards/${board.id}/history`);
+        list.replaceChildren(...chain.map((item, i) => h('li', { class: item.current ? 'current' : '' },
+          h('span', { class: 'history-num' }, `${i + 1}.`),
+          item.current
+            ? h('span', { class: 'history-title' }, item.title)
+            : h('a', { href: '/b/' + item.id, class: 'history-title' }, item.title),
+          h('span', { class: 'history-meta' },
+            new Date(item.createdAt).toLocaleDateString('ru-RU'),
+            item.openActions ? ` · открытых решений: ${item.openActions}` : ''))));
+      } catch (err) {
+        list.replaceChildren(h('li', { class: 'muted' }, err.message));
+      }
+    });
+    // replaceChildren превращает null в текст «null», поэтому фильтруем.
+    chainEl.replaceChildren(...[
+      board.prevId ? h('a', { href: '/b/' + board.prevId, class: 'chain-link', title: 'Предыдущее ретро' }, '← предыдущее') : null,
+      board.nextId ? h('a', { href: '/b/' + board.nextId, class: 'chain-link', title: 'Следующее ретро' }, 'следующее →') : null,
+      details,
+    ].filter(Boolean));
+  }
+
   function renderTools() {
     const items = [];
     items.push(h('label', { class: 'tool' }, 'Имя',
@@ -434,6 +486,12 @@ function renderBoardPage(root, id) {
       }, 'Скачать .md'));
     }
     items.push(h('button', { type: 'button', class: 'tool', onclick: copyLink }, 'Скопировать ссылку'));
+    if (board.isOwner && board.phase === 'discuss' && !board.nextId) {
+      items.push(h('button', {
+        type: 'button', class: 'tool', onclick: createNextBoard,
+        title: 'Новая доска той же команды: незакрытые решения перейдут в неё',
+      }, 'Следующее ретро'));
+    }
     toolsEl.replaceChildren(...items);
   }
 
@@ -493,7 +551,8 @@ function renderBoardPage(root, id) {
         h('p', { class: 'text' }, action.text)),
       h('div', { class: 'card-foot' },
         h('span', { class: 'meta' },
-          h('span', { class: 'assignee' }, action.assignee || 'ответственный не назначен')),
+          h('span', { class: 'assignee' }, action.assignee || 'ответственный не назначен'),
+          action.carried ? h('span', { class: 'carried', title: 'Перенесено из предыдущего ретро' }, 'перенесено') : null),
         h('span', { class: 'card-actions' }, controls)));
   }
 

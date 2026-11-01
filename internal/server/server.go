@@ -43,6 +43,8 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handle
 	m.HandleFunc("POST /api/boards/{id}/phase", s.handleSetPhase)
 	m.HandleFunc("POST /api/boards/{id}/vote-limit", s.handleSetVoteLimit)
 	m.HandleFunc("POST /api/boards/{id}/timer", s.handleSetTimer)
+	m.HandleFunc("POST /api/boards/{id}/next", s.handleNextBoard)
+	m.HandleFunc("GET /api/boards/{id}/history", s.handleHistory)
 	m.HandleFunc("POST /api/boards/{id}/cards", s.handleAddCard)
 	m.HandleFunc("PATCH /api/boards/{id}/cards/{cardId}", s.handleEditCard)
 	m.HandleFunc("DELETE /api/boards/{id}/cards/{cardId}", s.handleDeleteCard)
@@ -314,6 +316,104 @@ func (s *Server) handleToggleActionDone(w http.ResponseWriter, r *http.Request) 
 		_, err := b.ToggleActionDone(actionID, pid)
 		return err
 	})
+}
+
+// handleNextBoard создаёт следующее ретро из текущего. Сначала в предыдущей
+// доске резервируется NextID (проверка прав и «следующего ещё нет» идёт под
+// её мьютексом), затем создаётся новая доска; если создать не удалось,
+// NextID снимается.
+func (s *Server) handleNextBoard(w http.ResponseWriter, r *http.Request) {
+	pid, err := participant(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	var in struct {
+		Title string `json:"title"`
+	}
+	if err := decode(w, r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	prevID := r.PathValue("id")
+	var next *model.Board
+	if _, err := s.store.Update(prevID, func(prev *model.Board) error {
+		b, err := prev.NextBoard(in.Title, pid)
+		if err != nil {
+			return err
+		}
+		prev.NextID = b.ID
+		next = b
+		return nil
+	}); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.store.Create(next); err != nil {
+		_, _ = s.store.Update(prevID, func(prev *model.Board) error {
+			prev.NextID = ""
+			return nil
+		})
+		s.writeErr(w, err)
+		return
+	}
+	s.hub.Notify(prevID)
+	s.log.Info("создано следующее ретро", "board", next.ID, "prev", prevID)
+	writeJSON(w, http.StatusCreated, next.View(pid))
+}
+
+// historyItem — одно ретро в цепочке команды.
+type historyItem struct {
+	ID          string      `json:"id"`
+	Title       string      `json:"title"`
+	Phase       model.Phase `json:"phase"`
+	CreatedAt   time.Time   `json:"createdAt"`
+	OpenActions int         `json:"openActions"`
+	Current     bool        `json:"current"`
+}
+
+// handleHistory отдаёт цепочку ретро, в которую входит доска, от первого к
+// последнему. Длина ограничена, чтобы повреждённые ссылки не зациклили обход.
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cur, err := s.store.Get(id)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	const limit = 200
+	item := func(b *model.Board) historyItem {
+		open := 0
+		for _, a := range b.Actions {
+			if !a.Done {
+				open++
+			}
+		}
+		return historyItem{ID: b.ID, Title: b.Title, Phase: b.Phase, CreatedAt: b.CreatedAt, OpenActions: open, Current: b.ID == id}
+	}
+	var back []historyItem
+	for b, n := cur, 0; b.PrevID != "" && n < limit; n++ {
+		p, err := s.store.Get(b.PrevID)
+		if err != nil {
+			break
+		}
+		back = append(back, item(p))
+		b = p
+	}
+	chain := make([]historyItem, 0, len(back)+1)
+	for i := len(back) - 1; i >= 0; i-- {
+		chain = append(chain, back[i])
+	}
+	chain = append(chain, item(cur))
+	for b, n := cur, 0; b.NextID != "" && n < limit; n++ {
+		nx, err := s.store.Get(b.NextID)
+		if err != nil {
+			break
+		}
+		chain = append(chain, item(nx))
+		b = nx
+	}
+	writeJSON(w, http.StatusOK, chain)
 }
 
 func (s *Server) handleSetTimer(w http.ResponseWriter, r *http.Request) {

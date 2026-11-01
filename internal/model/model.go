@@ -68,19 +68,25 @@ type Board struct {
 	TimerEndsAt *time.Time `json:"timerEndsAt,omitempty"`
 	Columns     []Column   `json:"columns"`
 	Actions     []Action   `json:"actions"` // решения ретро
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
+	// PrevID и NextID связывают ретро одной команды в цепочку: следующее
+	// ретро создаётся из предыдущего и забирает его незакрытые решения.
+	PrevID    string    `json:"prevId,omitempty"`
+	NextID    string    `json:"nextId,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // Action — решение ретро (action item): что сделать и кто отвечает.
 // Появляются после фазы записи, когда карточки уже обсуждаются.
 type Action struct {
-	ID        string    `json:"id"`
-	Text      string    `json:"text"`
-	Assignee  string    `json:"assignee"` // ответственный; пустая строка — не назначен
-	AuthorID  string    `json:"authorId"` // кто записал решение
-	Done      bool      `json:"done"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID       string `json:"id"`
+	Text     string `json:"text"`
+	Assignee string `json:"assignee"` // ответственный; пустая строка — не назначен
+	AuthorID string `json:"authorId"` // кто записал решение
+	Done     bool   `json:"done"`
+	// CarriedFrom — id ретро, из которого решение перенесено незакрытым.
+	CarriedFrom string    `json:"carriedFrom,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
 }
 
 // Column — колонка доски.
@@ -167,6 +173,42 @@ func NewBoard(title, templateID, ownerID string) (*Board, error) {
 	}
 	for _, name := range t.Columns {
 		b.Columns = append(b.Columns, Column{ID: NewID(), Title: name, Cards: []Card{}})
+	}
+	return b, nil
+}
+
+// NextBoard создаёт следующее ретро той же команды: тот же шаблон и ведущий,
+// ссылка на предыдущее, незакрытые решения переносятся с пометкой откуда.
+// Только ведущий, и только если следующего ещё нет. Связь prev.NextID
+// выставляет вызывающий код после успешного сохранения новой доски.
+func (prev *Board) NextBoard(title, actorID string) (*Board, error) {
+	if actorID != prev.OwnerID {
+		return nil, ErrForbidden
+	}
+	if prev.NextID != "" {
+		return nil, fmt.Errorf("%w: у этого ретро уже есть следующее", ErrInvalid)
+	}
+	if strings.TrimSpace(title) == "" {
+		title = prev.Title
+	}
+	b, err := NewBoard(title, prev.Template, prev.OwnerID)
+	if err != nil {
+		return nil, err
+	}
+	b.PrevID = prev.ID
+	b.VoteLimit = prev.VoteLimit
+	for _, a := range prev.Actions {
+		if a.Done {
+			continue
+		}
+		b.Actions = append(b.Actions, Action{
+			ID:          NewID(),
+			Text:        a.Text,
+			Assignee:    a.Assignee,
+			AuthorID:    a.AuthorID,
+			CarriedFrom: prev.ID,
+			CreatedAt:   b.CreatedAt,
+		})
 	}
 	return b, nil
 }
@@ -629,6 +671,8 @@ type BoardView struct {
 	TimerEndsAt *time.Time   `json:"timerEndsAt,omitempty"`
 	Columns     []ColumnView `json:"columns"`
 	Actions     []ActionView `json:"actions"`
+	PrevID      string       `json:"prevId,omitempty"`
+	NextID      string       `json:"nextId,omitempty"`
 	UpdatedAt   time.Time    `json:"updatedAt"`
 }
 
@@ -661,7 +705,8 @@ type ActionView struct {
 	Text     string `json:"text"`
 	Assignee string `json:"assignee"`
 	Done     bool   `json:"done"`
-	Mine     bool   `json:"mine"` // записано этим участником — можно править
+	Mine     bool   `json:"mine"`    // записано этим участником — можно править
+	Carried  bool   `json:"carried"` // перенесено из предыдущего ретро
 }
 
 // View строит представление доски для участника viewer.
@@ -676,6 +721,8 @@ func (b *Board) View(viewer string) BoardView {
 		IsOwner:     viewer == b.OwnerID,
 		TimerEndsAt: b.TimerEndsAt,
 		Columns:     make([]ColumnView, 0, len(b.Columns)),
+		PrevID:      b.PrevID,
+		NextID:      b.NextID,
 		UpdatedAt:   b.UpdatedAt,
 	}
 	if v.VotesLeft < 0 {
@@ -711,7 +758,8 @@ func (b *Board) View(viewer string) BoardView {
 	v.Actions = make([]ActionView, 0, len(b.Actions))
 	for _, a := range b.Actions {
 		v.Actions = append(v.Actions, ActionView{
-			ID: a.ID, Text: a.Text, Assignee: a.Assignee, Done: a.Done, Mine: a.AuthorID == viewer,
+			ID: a.ID, Text: a.Text, Assignee: a.Assignee, Done: a.Done,
+			Mine: a.AuthorID == viewer, Carried: a.CarriedFrom != "",
 		})
 	}
 	return v
@@ -767,6 +815,9 @@ func (b *Board) Markdown() string {
 			fmt.Fprintf(&sb, "- [%s] %s", mark, text)
 			if a.Assignee != "" {
 				fmt.Fprintf(&sb, " — %s", a.Assignee)
+			}
+			if a.CarriedFrom != "" {
+				sb.WriteString(" (перенесено)")
 			}
 			sb.WriteString("\n")
 		}

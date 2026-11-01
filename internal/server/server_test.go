@@ -109,6 +109,58 @@ func TestBoardFlow(t *testing.T) {
 	}
 }
 
+func TestNextBoardAndHistory(t *testing.T) {
+	h := newTestServer(t)
+	const owner, alice = "owner-00000001", "alice-00000001"
+
+	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Спринт 1", "template": "4l"})
+	first := out["id"].(string)
+	do(t, h, "POST", "/api/boards/"+first+"/phase", owner, map[string]any{"phase": "discuss"})
+	do(t, h, "POST", "/api/boards/"+first+"/actions", alice, map[string]any{"text": "Открытое", "assignee": "Боб"})
+	_, out = do(t, h, "POST", "/api/boards/"+first+"/actions", alice, map[string]any{"text": "Закрытое"})
+	acts := out["actions"].([]any)
+	closedID := acts[len(acts)-1].(map[string]any)["id"].(string)
+	do(t, h, "POST", "/api/boards/"+first+"/actions/"+closedID+"/done", alice, nil)
+
+	if rec, _ := do(t, h, "POST", "/api/boards/"+first+"/next", alice, map[string]any{"title": "Спринт 2"}); rec.Code != http.StatusForbidden {
+		t.Fatalf("следующее ретро не ведущим: %d", rec.Code)
+	}
+	rec, out := do(t, h, "POST", "/api/boards/"+first+"/next", owner, map[string]any{"title": "Спринт 2"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("следующее ретро: %d %s", rec.Code, rec.Body)
+	}
+	second := out["id"].(string)
+	if out["prevId"] != first || out["title"] != "Спринт 2" || out["phase"] != "write" {
+		t.Fatalf("новая доска: %v", out)
+	}
+	acts = out["actions"].([]any)
+	if len(acts) != 1 || acts[0].(map[string]any)["carried"] != true || acts[0].(map[string]any)["text"] != "Открытое" {
+		t.Fatalf("должно перенестись одно открытое решение с пометкой: %v", acts)
+	}
+	_, out = do(t, h, "GET", "/api/boards/"+first, alice, nil)
+	if out["nextId"] != second {
+		t.Fatalf("предыдущая доска должна ссылаться на следующую: %v", out["nextId"])
+	}
+	if rec, _ := do(t, h, "POST", "/api/boards/"+first+"/next", owner, map[string]any{}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("второе следующее ретро: %d", rec.Code)
+	}
+
+	req := httptest.NewRequest("GET", "/api/boards/"+second+"/history", nil)
+	req.Header.Set("X-Participant", alice)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	var chain []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &chain); err != nil || w.Code != http.StatusOK {
+		t.Fatalf("история: %d %s", w.Code, w.Body)
+	}
+	if len(chain) != 2 || chain[0]["id"] != first || chain[1]["id"] != second {
+		t.Fatalf("цепочка от первого к последнему: %v", chain)
+	}
+	if chain[0]["current"] != false || chain[1]["current"] != true || chain[0]["openActions"].(float64) != 1 {
+		t.Fatalf("пометка текущего и счётчик открытых решений: %v", chain)
+	}
+}
+
 func TestGroupEndpoints(t *testing.T) {
 	h := newTestServer(t)
 	const owner, alice = "owner-00000001", "alice-00000001"

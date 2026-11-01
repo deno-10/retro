@@ -109,6 +109,39 @@ input[type=text], input[type=number], select, textarea {
 .home { text-decoration: none; color: var(--muted); font-size: 14px; white-space: nowrap; }
 .home:hover { color: var(--accent); }
 .board-title { font-size: 19px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Цепочка ретро одной команды */
+.chain { display: flex; align-items: baseline; gap: 12px; font-size: 13px; white-space: nowrap; margin-left: auto; }
+.chain:empty { display: none; }
+.chain-link { color: var(--muted); text-decoration: none; }
+.chain-link:hover { color: var(--accent); }
+.history-box { position: relative; }
+.history-box summary { cursor: pointer; color: var(--muted); list-style: none; }
+.history-box summary::-webkit-details-marker { display: none; }
+.history-box summary:hover { color: var(--accent); }
+.history {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 5;
+  margin: 6px 0 0;
+  padding: 8px 0;
+  min-width: 280px;
+  text-align: left;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.history li { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; padding: 6px 14px; }
+.history li.current { background: var(--surface-2); }
+.history-num { color: var(--muted); }
+.history-title { color: var(--ink); text-decoration: none; }
+a.history-title:hover { color: var(--accent); }
+.history-meta { grid-column: 2; color: var(--muted); font-size: 12px; }
+.history li.muted { display: block; color: var(--muted); }
+.carried { color: var(--muted); font-style: italic; white-space: nowrap; }
 .tools {
   display: flex;
   justify-content: flex-end;
