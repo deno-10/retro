@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,68 @@ func TestDiscussSortsByVotes(t *testing.T) {
 	}
 	if md := b.Markdown(); !containsAll(md, "## Что было хорошо", "- вторая (2 голоса)", "- первая (1 голос)") {
 		t.Fatalf("неожиданный markdown:\n%s", md)
+	}
+}
+
+func TestActions(t *testing.T) {
+	b := newTestBoard(t)
+	if _, err := b.AddAction("рано", "", "alice"); err != ErrPhase {
+		t.Fatalf("в фазе записи решения недоступны, получено %v", err)
+	}
+	if err := b.SetPhase(PhaseDiscuss, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.AddAction("   ", "", "alice"); err == nil {
+		t.Fatal("пустое решение должно давать ошибку")
+	}
+	a, err := b.AddAction("Настроить алерты", " Боб ", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Assignee != "Боб" {
+		t.Fatalf("ответственный должен быть обрезан: %q", a.Assignee)
+	}
+	id := a.ID
+
+	if err := b.EditAction(id, "x", "", "bob"); err != ErrForbidden {
+		t.Fatalf("чужое решение править нельзя: %v", err)
+	}
+	if _, err := b.ToggleActionDone(id, "bob"); err != ErrForbidden {
+		t.Fatalf("чужое решение отмечать нельзя: %v", err)
+	}
+	if err := b.EditAction(id, "Настроить алерты в проде", "Боб", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := b.ToggleActionDone(id, "owner-1"); err != nil || !done {
+		t.Fatalf("ведущий может отметить сделанным: done=%v err=%v", done, err)
+	}
+	if done, err := b.ToggleActionDone(id, "alice"); err != nil || done {
+		t.Fatalf("повторная отметка снимает: done=%v err=%v", done, err)
+	}
+
+	v := b.View("alice")
+	if len(v.Actions) != 1 || !v.Actions[0].Mine || v.Actions[0].Text != "Настроить алерты в проде" {
+		t.Fatalf("неожиданное представление решений: %+v", v.Actions)
+	}
+	if b.View("bob").Actions[0].Mine {
+		t.Fatal("чужое решение не должно помечаться как своё")
+	}
+
+	if _, err := b.ToggleActionDone(id, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if md := b.Markdown(); !containsAll(md, "## Решения", "- [x] Настроить алерты в проде — Боб") {
+		t.Fatalf("решения должны попадать в markdown:\n%s", md)
+	}
+
+	if err := b.DeleteAction(id, "bob"); err != ErrForbidden {
+		t.Fatalf("чужое решение удалять нельзя: %v", err)
+	}
+	if err := b.DeleteAction(id, "owner-1"); err != nil || len(b.Actions) != 0 {
+		t.Fatalf("ведущий удаляет любое решение: err=%v n=%d", err, len(b.Actions))
+	}
+	if err := b.DeleteAction("nope", "owner-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ожидался ErrNotFound, получено %v", err)
 	}
 }
 

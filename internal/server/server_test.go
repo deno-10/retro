@@ -109,6 +109,58 @@ func TestBoardFlow(t *testing.T) {
 	}
 }
 
+func TestActionsFlow(t *testing.T) {
+	h := newTestServer(t)
+	const owner, alice, bob = "owner-00000001", "alice-00000001", "bob-0000000001"
+
+	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Решения", "template": "classic"})
+	id := out["id"].(string)
+
+	rec, _ := do(t, h, "POST", "/api/boards/"+id+"/actions", alice, map[string]any{"text": "рано"})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("решение в фазе записи: %d", rec.Code)
+	}
+	if rec, _ = do(t, h, "POST", "/api/boards/"+id+"/phase", owner, map[string]any{"phase": "discuss"}); rec.Code != http.StatusOK {
+		t.Fatalf("смена фазы: %d", rec.Code)
+	}
+	rec, out = do(t, h, "POST", "/api/boards/"+id+"/actions", alice,
+		map[string]any{"text": "Настроить алерты", "assignee": "Боб"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("добавление решения: %d %s", rec.Code, rec.Body)
+	}
+	actions := out["actions"].([]any)
+	if len(actions) != 1 {
+		t.Fatalf("ожидалось одно решение: %v", out["actions"])
+	}
+	action := actions[0].(map[string]any)
+	actionID := action["id"].(string)
+	if action["assignee"] != "Боб" || action["mine"] != true || action["done"] != false {
+		t.Fatalf("неожиданное решение: %v", action)
+	}
+
+	if rec, _ = do(t, h, "PATCH", "/api/boards/"+id+"/actions/"+actionID, bob, map[string]any{"text": "x"}); rec.Code != http.StatusForbidden {
+		t.Fatalf("правка чужого решения: %d", rec.Code)
+	}
+	rec, out = do(t, h, "POST", "/api/boards/"+id+"/actions/"+actionID+"/done", owner, nil)
+	if rec.Code != http.StatusOK || out["actions"].([]any)[0].(map[string]any)["done"] != true {
+		t.Fatalf("отметка сделанным ведущим: %d %s", rec.Code, rec.Body)
+	}
+	rec, _ = do(t, h, "GET", "/api/boards/"+id+"/export.md", bob, nil)
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte("- [x] Настроить алерты — Боб")) {
+		t.Fatalf("экспорт решений: %d %s", rec.Code, rec.Body)
+	}
+	if rec, _ = do(t, h, "DELETE", "/api/boards/"+id+"/actions/"+actionID, bob, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("удаление чужого решения: %d", rec.Code)
+	}
+	rec, out = do(t, h, "DELETE", "/api/boards/"+id+"/actions/"+actionID, alice, nil)
+	if rec.Code != http.StatusOK || len(out["actions"].([]any)) != 0 {
+		t.Fatalf("удаление своего решения: %d %s", rec.Code, rec.Body)
+	}
+	if rec, _ = do(t, h, "DELETE", "/api/boards/"+id+"/actions/nope", owner, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("удаление несуществующего решения: %d", rec.Code)
+	}
+}
+
 func TestTimerEndpoint(t *testing.T) {
 	h := newTestServer(t)
 	const owner, bob = "owner-00000001", "bob-0000000001"

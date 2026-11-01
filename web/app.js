@@ -206,7 +206,9 @@ function renderBoardPage(root, id) {
   let board = null;
   let online = 0;
   let editingId = null;
+  let editingActionId = null;
   const drafts = {};
+  const actionDraft = { text: '', assignee: '' };
 
   const titleEl = h('h1', { class: 'board-title' });
   const phaseNav = h('nav', { class: 'phases', 'aria-label': 'Фазы ретро' });
@@ -255,6 +257,17 @@ function renderBoardPage(root, id) {
 
   async function vote(cardId) {
     try { await api('POST', `/api/boards/${board.id}/cards/${cardId}/vote`); }
+    catch (err) { toast(err.message); }
+  }
+
+  async function toggleActionDone(actionId) {
+    try { await api('POST', `/api/boards/${board.id}/actions/${actionId}/done`); }
+    catch (err) { toast(err.message); }
+  }
+
+  async function removeAction(action) {
+    if (!confirm('Удалить решение?')) return;
+    try { await api('DELETE', `/api/boards/${board.id}/actions/${action.id}`); }
     catch (err) { toast(err.message); }
   }
 
@@ -412,7 +425,7 @@ function renderBoardPage(root, id) {
   }
 
   function renderColumns() {
-    columnsEl.replaceChildren(...board.columns.map(col => {
+    const columns = board.columns.map(col => {
       const empty = col.cards.length === 0
         ? h('p', { class: 'empty' }, canWrite() ? 'Пока пусто — добавьте первую карточку.' : 'Пусто.')
         : null;
@@ -422,7 +435,129 @@ function renderBoardPage(root, id) {
         h('ul', { class: 'cards' }, col.cards.map(renderCard)),
         canWrite() ? renderComposer(col) : null,
       );
-    }));
+    });
+    const actions = renderActions();
+    columnsEl.replaceChildren(...columns, ...(actions ? [actions] : []));
+  }
+
+  // --- решения (action items) ---
+
+  // Панель решений появляется после фазы записи: пока карточки скрыты,
+  // договариваться не о чем. Если решения уже есть, панель видна всегда.
+  function renderActions() {
+    const open = board.phase !== 'write';
+    if (!open && board.actions.length === 0) return null;
+    const done = board.actions.filter(a => a.done).length;
+    const empty = board.actions.length === 0
+      ? h('p', { class: 'empty' }, 'Что команда решила сделать и кто отвечает.')
+      : null;
+    return h('section', { class: 'column actions', 'aria-label': 'Решения' },
+      h('header', { class: 'column-head' },
+        h('h2', {}, 'Решения'),
+        h('span', { class: 'count' }, board.actions.length ? `${done} из ${board.actions.length}` : '0')),
+      empty,
+      h('ul', { class: 'cards' }, board.actions.map(renderAction)),
+      open ? renderActionComposer() : null,
+    );
+  }
+
+  function renderAction(action) {
+    if (editingActionId === action.id) return renderActionEditor(action);
+    const editable = action.mine || board.isOwner;
+    const checkbox = h('input', {
+      type: 'checkbox', checked: action.done, disabled: !editable,
+      'aria-label': action.done ? 'Сделано' : 'Не сделано',
+      onchange: () => toggleActionDone(action.id),
+    });
+    const controls = [];
+    if (editable) {
+      controls.push(h('button', { type: 'button', class: 'link', onclick: () => { editingActionId = action.id; render(); } }, 'Изменить'));
+      controls.push(h('button', { type: 'button', class: 'link danger', onclick: () => removeAction(action) }, 'Удалить'));
+    }
+    return h('li', { class: 'card action' + (action.done ? ' done' : '') },
+      h('div', { class: 'action-row' },
+        checkbox,
+        h('p', { class: 'text' }, action.text)),
+      h('div', { class: 'card-foot' },
+        h('span', { class: 'meta' },
+          h('span', { class: 'assignee' }, action.assignee || 'ответственный не назначен')),
+        h('span', { class: 'card-actions' }, controls)));
+  }
+
+  function renderActionComposer() {
+    const text = h('textarea', {
+      rows: 2, maxlength: 2000, placeholder: 'Что сделать',
+      value: actionDraft.text, dataset: { keep: 'action-text' },
+      oninput: e => { actionDraft.text = e.target.value; },
+      onkeydown: e => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+      },
+    });
+    const assignee = h('input', {
+      type: 'text', maxlength: 60, placeholder: 'Ответственный',
+      value: actionDraft.assignee, dataset: { keep: 'action-assignee' },
+      oninput: e => { actionDraft.assignee = e.target.value; },
+      onkeydown: e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } },
+    });
+    const btn = h('button', { type: 'button', class: 'primary small', onclick: submit }, 'Записать');
+
+    async function submit() {
+      const value = text.value.trim();
+      if (!value) return;
+      const who = assignee.value.trim();
+      actionDraft.text = '';
+      text.value = '';
+      btn.disabled = true;
+      try {
+        await api('POST', `/api/boards/${board.id}/actions`, { text: value, assignee: who });
+      } catch (err) {
+        actionDraft.text = value;
+        const live = columnsEl.querySelector('[data-keep="action-text"]');
+        if (live) live.value = value;
+        toast(err.message);
+      } finally {
+        btn.disabled = false;
+        const live = columnsEl.querySelector('[data-keep="action-text"]');
+        if (live) live.focus();
+      }
+    }
+    return h('div', { class: 'composer' }, text, h('div', { class: 'composer-row' }, assignee, btn));
+  }
+
+  function renderActionEditor(action) {
+    const text = h('textarea', {
+      rows: 3, maxlength: 2000, value: action.text, dataset: { keep: 'action-edit:' + action.id },
+      onkeydown: e => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
+        if (e.key === 'Escape') { cancel(); }
+      },
+    });
+    const assignee = h('input', {
+      type: 'text', maxlength: 60, placeholder: 'Ответственный', value: action.assignee,
+      dataset: { keep: 'action-edit-assignee:' + action.id },
+      onkeydown: e => {
+        if (e.key === 'Enter') { e.preventDefault(); save(); }
+        if (e.key === 'Escape') { cancel(); }
+      },
+    });
+    const cancel = () => { editingActionId = null; render(); };
+    const save = async () => {
+      const value = text.value.trim();
+      if (!value) return;
+      try {
+        await api('PATCH', `/api/boards/${board.id}/actions/${action.id}`, { text: value, assignee: assignee.value.trim() });
+        editingActionId = null;
+        render();
+      } catch (err) {
+        toast(err.message);
+      }
+    };
+    const el = h('li', { class: 'card editing' }, text, assignee,
+      h('div', { class: 'card-actions' },
+        h('button', { type: 'button', class: 'primary small', onclick: save }, 'Сохранить'),
+        h('button', { type: 'button', class: 'small', onclick: cancel }, 'Отмена')));
+    queueMicrotask(() => { if (document.activeElement !== text) text.focus(); });
+    return el;
   }
 
   function renderComposer(col) {

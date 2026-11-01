@@ -239,6 +239,19 @@ button.phase:hover:not(:disabled) { border-color: var(--accent); color: var(--in
 .composer { display: grid; gap: 8px; }
 .composer textarea { width: 100%; resize: vertical; min-height: 58px; }
 .composer button { justify-self: end; }
+.composer-row { display: flex; gap: 8px; align-items: center; }
+.composer-row input { flex: 1; min-width: 0; padding: 6px 8px; font-size: 14px; }
+
+/* Решения */
+.column.actions { border: 1px solid var(--accent); }
+.action-row { display: flex; gap: 10px; align-items: flex-start; }
+.action-row input[type=checkbox] { margin: 4px 0 0; flex-shrink: 0; accent-color: var(--accent); }
+.action-row .text { margin: 0; flex: 1; }
+.action .card-foot { margin-top: 8px; }
+.action.done .text { text-decoration: line-through; color: var(--muted); }
+.assignee { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.action.done .assignee { color: var(--muted); }
+.card.editing input[type=text] { width: 100%; padding: 6px 8px; font-size: 14px; }
 
 /* Голоса — точки */
 .vote {

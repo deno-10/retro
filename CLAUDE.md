@@ -31,7 +31,7 @@ Go 1.26+ is required (`go.mod` pins it because `modernc.org/sqlite` needs it; `G
 
 ## Roadmap
 
-The project roadmap lives in `README.md`, section «Дальше» (Postgres as a new `Store` implementation, OIDC SSO, drag-and-drop grouping, action items). Consult it before proposing new features, and update it there rather than duplicating it here.
+The project roadmap lives in `README.md`, section «Дальше» (Postgres as a new `Store` implementation, OIDC SSO, drag-and-drop grouping, teams with board history and carry-over of open action items). Consult it before proposing new features, and update it there rather than duplicating it here.
 
 ## Architecture
 

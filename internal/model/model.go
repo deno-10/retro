@@ -67,8 +67,20 @@ type Board struct {
 	// Таймер только информирует: фазу по его истечении переключает ведущий.
 	TimerEndsAt *time.Time `json:"timerEndsAt,omitempty"`
 	Columns     []Column   `json:"columns"`
+	Actions     []Action   `json:"actions"` // решения ретро
 	CreatedAt   time.Time  `json:"createdAt"`
 	UpdatedAt   time.Time  `json:"updatedAt"`
+}
+
+// Action — решение ретро (action item): что сделать и кто отвечает.
+// Появляются после фазы записи, когда карточки уже обсуждаются.
+type Action struct {
+	ID        string    `json:"id"`
+	Text      string    `json:"text"`
+	Assignee  string    `json:"assignee"` // ответственный; пустая строка — не назначен
+	AuthorID  string    `json:"authorId"` // кто записал решение
+	Done      bool      `json:"done"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // Column — колонка доски.
@@ -313,6 +325,108 @@ func (b *Board) SetPhase(p Phase, actorID string) error {
 	return nil
 }
 
+func (b *Board) findAction(actionID string) *Action {
+	for i := range b.Actions {
+		if b.Actions[i].ID == actionID {
+			return &b.Actions[i]
+		}
+	}
+	return nil
+}
+
+func cleanAssignee(assignee string) (string, error) {
+	assignee = strings.TrimSpace(assignee)
+	if utf8.RuneCountInString(assignee) > MaxNameLen {
+		return "", fmt.Errorf("%w: имя ответственного длиннее %d символов", ErrInvalid, MaxNameLen)
+	}
+	return assignee, nil
+}
+
+// canEditAction: решение правят ведущий и тот, кто его записал.
+// Фаза не важна: решения уточняют и после ретро.
+func (b *Board) canEditAction(a *Action, actorID string) error {
+	if actorID == b.OwnerID || a.AuthorID == actorID {
+		return nil
+	}
+	return ErrForbidden
+}
+
+// AddAction записывает решение. Недоступно в фазе записи: решения
+// появляются, когда карточки уже видны всем.
+func (b *Board) AddAction(text, assignee, authorID string) (*Action, error) {
+	if b.Phase == PhaseWrite {
+		return nil, ErrPhase
+	}
+	text, err := cleanText(text)
+	if err != nil {
+		return nil, err
+	}
+	assignee, err = cleanAssignee(assignee)
+	if err != nil {
+		return nil, err
+	}
+	b.Actions = append(b.Actions, Action{
+		ID:        NewID(),
+		Text:      text,
+		Assignee:  assignee,
+		AuthorID:  authorID,
+		CreatedAt: time.Now(),
+	})
+	return &b.Actions[len(b.Actions)-1], nil
+}
+
+// EditAction меняет текст и ответственного решения.
+func (b *Board) EditAction(actionID, text, assignee, actorID string) error {
+	a := b.findAction(actionID)
+	if a == nil {
+		return fmt.Errorf("%w: решение не найдено", ErrNotFound)
+	}
+	if err := b.canEditAction(a, actorID); err != nil {
+		return err
+	}
+	text, err := cleanText(text)
+	if err != nil {
+		return err
+	}
+	assignee, err = cleanAssignee(assignee)
+	if err != nil {
+		return err
+	}
+	a.Text, a.Assignee = text, assignee
+	return nil
+}
+
+// ToggleActionDone переключает отметку «сделано». Возвращает новое состояние.
+func (b *Board) ToggleActionDone(actionID, actorID string) (bool, error) {
+	a := b.findAction(actionID)
+	if a == nil {
+		return false, fmt.Errorf("%w: решение не найдено", ErrNotFound)
+	}
+	if err := b.canEditAction(a, actorID); err != nil {
+		return false, err
+	}
+	a.Done = !a.Done
+	return a.Done, nil
+}
+
+// DeleteAction удаляет решение.
+func (b *Board) DeleteAction(actionID, actorID string) error {
+	a := b.findAction(actionID)
+	if a == nil {
+		return fmt.Errorf("%w: решение не найдено", ErrNotFound)
+	}
+	if err := b.canEditAction(a, actorID); err != nil {
+		return err
+	}
+	for i := range b.Actions {
+		if b.Actions[i].ID == actionID {
+			b.Actions = append(b.Actions[:i], b.Actions[i+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
+
 // SetTimer запускает таймер фазы на minutes минут от now. Только ведущий.
 // minutes == 0 останавливает таймер.
 func (b *Board) SetTimer(minutes int, now time.Time, actorID string) error {
@@ -354,6 +468,7 @@ type BoardView struct {
 	IsOwner     bool         `json:"isOwner"`
 	TimerEndsAt *time.Time   `json:"timerEndsAt,omitempty"`
 	Columns     []ColumnView `json:"columns"`
+	Actions     []ActionView `json:"actions"`
 	UpdatedAt   time.Time    `json:"updatedAt"`
 }
 
@@ -373,6 +488,15 @@ type CardView struct {
 	Hidden bool   `json:"hidden"`
 	Votes  int    `json:"votes"`
 	Voted  bool   `json:"voted"`
+}
+
+// ActionView — решение в представлении участника.
+type ActionView struct {
+	ID       string `json:"id"`
+	Text     string `json:"text"`
+	Assignee string `json:"assignee"`
+	Done     bool   `json:"done"`
+	Mine     bool   `json:"mine"` // записано этим участником — можно править
 }
 
 // View строит представление доски для участника viewer.
@@ -418,6 +542,12 @@ func (b *Board) View(viewer string) BoardView {
 		}
 		v.Columns = append(v.Columns, cv)
 	}
+	v.Actions = make([]ActionView, 0, len(b.Actions))
+	for _, a := range b.Actions {
+		v.Actions = append(v.Actions, ActionView{
+			ID: a.ID, Text: a.Text, Assignee: a.Assignee, Done: a.Done, Mine: a.AuthorID == viewer,
+		})
+	}
 	return v
 }
 
@@ -442,6 +572,22 @@ func (b *Board) Markdown() string {
 			}
 			if n := len(c.Votes); n > 0 {
 				fmt.Fprintf(&sb, " (%d %s)", n, plural(n, "голос", "голоса", "голосов"))
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+	if len(b.Actions) > 0 {
+		sb.WriteString("## Решения\n\n")
+		for _, a := range b.Actions {
+			mark := " "
+			if a.Done {
+				mark = "x"
+			}
+			text := strings.ReplaceAll(strings.TrimSpace(a.Text), "\n", "\n  ")
+			fmt.Fprintf(&sb, "- [%s] %s", mark, text)
+			if a.Assignee != "" {
+				fmt.Fprintf(&sb, " — %s", a.Assignee)
 			}
 			sb.WriteString("\n")
 		}
