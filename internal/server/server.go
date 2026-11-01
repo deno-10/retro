@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"retro/internal/hub"
@@ -24,7 +25,16 @@ type Server struct {
 	hub   *hub.Hub
 	log   *slog.Logger
 	index []byte
+
+	// timers — запланированные срабатывания таймеров фаз по id доски.
+	// Планировщик живёт в памяти процесса; после рестарта таймеры
+	// восстанавливаются лениво — при первом чтении доски (syncTimer).
+	mu     sync.Mutex
+	timers map[string]*time.Timer
 }
+
+// errTimerNotDue — таймер ещё не истёк (или уже снят): Update откатывается.
+var errTimerNotDue = errors.New("таймер ещё не истёк")
 
 // New собирает маршрутизатор. static — содержимое каталога web/.
 func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handler {
@@ -32,7 +42,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handle
 	if err != nil {
 		panic("web/index.html не найден: " + err.Error())
 	}
-	s := &Server{store: st, hub: h, log: log, index: index}
+	s := &Server{store: st, hub: h, log: log, index: index, timers: map[string]*time.Timer{}}
 
 	m := http.NewServeMux()
 	m.HandleFunc("GET /api/templates", s.handleTemplates)
@@ -133,7 +143,67 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn func(b *model
 		return
 	}
 	s.hub.Notify(id)
+	b = s.syncTimer(b)
 	writeJSON(w, http.StatusOK, b.View(pid))
+}
+
+// --- таймер фазы: автоматический переход на следующий этап ---
+
+// syncTimer приводит планировщик в соответствие с доской: таймера нет —
+// отменить запланированное; уже истёк — применить сейчас; идёт — назначить
+// срабатывание. Возвращает доску после возможного применения.
+func (s *Server) syncTimer(b *model.Board) *model.Board {
+	if b.TimerEndsAt == nil {
+		s.cancelTimer(b.ID)
+		return b
+	}
+	if !time.Now().Before(*b.TimerEndsAt) {
+		if nb := s.fireTimer(b.ID); nb != nil {
+			return nb
+		}
+		return b
+	}
+	s.scheduleTimer(b.ID, *b.TimerEndsAt)
+	return b
+}
+
+func (s *Server) scheduleTimer(id string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.timers[id]; ok {
+		t.Stop()
+	}
+	s.timers[id] = time.AfterFunc(time.Until(at), func() { s.fireTimer(id) })
+}
+
+func (s *Server) cancelTimer(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.timers[id]; ok {
+		t.Stop()
+		delete(s.timers, id)
+	}
+}
+
+// fireTimer применяет истечение таймера к доске. Если таймер к этому моменту
+// снят или перенесён, Update откатывается и ничего не меняется.
+func (s *Server) fireTimer(id string) *model.Board {
+	s.cancelTimer(id)
+	b, err := s.store.Update(id, func(bd *model.Board) error {
+		if !bd.ExpireTimer(time.Now()) {
+			return errTimerNotDue
+		}
+		return nil
+	})
+	if err != nil {
+		if !errors.Is(err, errTimerNotDue) && !errors.Is(err, model.ErrNotFound) {
+			s.log.Error("таймер фазы не применён", "board", id, "err", err)
+		}
+		return nil
+	}
+	s.log.Info("таймер истёк, этап переключён", "board", id, "phase", b.Phase)
+	s.hub.Notify(id)
+	return b
 }
 
 func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +248,7 @@ func (s *Server) handleGetBoard(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	b = s.syncTimer(b) // после рестарта здесь таймер встаёт на место
 	writeJSON(w, http.StatusOK, b.View(pid))
 }
 
@@ -467,6 +538,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return false
 		}
+		b = s.syncTimer(b)
 		payload := struct {
 			model.BoardView
 			Online int `json:"online"`

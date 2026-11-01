@@ -406,6 +406,43 @@ func TestTimer(t *testing.T) {
 	}
 }
 
+func TestExpireTimerAdvancesPhase(t *testing.T) {
+	b := newTestBoard(t)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	if b.ExpireTimer(now) {
+		t.Fatal("без таймера истекать нечему")
+	}
+	if err := b.SetTimer(5, now, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if b.ExpireTimer(now.Add(4*time.Minute)) || b.Phase != PhaseWrite || b.TimerEndsAt == nil {
+		t.Fatal("до конца таймера ничего не должно меняться")
+	}
+	if !b.ExpireTimer(now.Add(5*time.Minute)) || b.Phase != PhaseReveal || b.TimerEndsAt != nil {
+		t.Fatalf("по истечении запись должна смениться показом и таймер сняться: phase=%s ends=%v", b.Phase, b.TimerEndsAt)
+	}
+	if b.ExpireTimer(now.Add(time.Hour)) {
+		t.Fatal("повторное применение не должно ничего менять")
+	}
+
+	if err := b.SetPhase(PhaseDiscuss, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetTimer(1, now, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !b.ExpireTimer(now.Add(time.Minute)) || b.Phase != PhaseDiscuss || b.TimerEndsAt != nil {
+		t.Fatalf("на последнем этапе таймер снимается, фаза остаётся: phase=%s ends=%v", b.Phase, b.TimerEndsAt)
+	}
+
+	if next, ok := PhaseVote.Next(); !ok || next != PhaseDiscuss {
+		t.Fatalf("после голосования идёт обсуждение, получено %s %v", next, ok)
+	}
+	if _, ok := PhaseDiscuss.Next(); ok {
+		t.Fatal("у обсуждения нет следующей фазы")
+	}
+}
+
 func containsAll(s string, parts ...string) bool {
 	for _, p := range parts {
 		if !strings.Contains(s, p) {

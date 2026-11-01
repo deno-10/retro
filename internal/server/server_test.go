@@ -10,19 +10,27 @@ import (
 	"path/filepath"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"retro/internal/hub"
+	"retro/internal/model"
 	"retro/internal/store"
 )
 
 func newTestServer(t *testing.T) http.Handler {
+	t.Helper()
+	h, _ := newTestServerWithStore(t)
+	return h
+}
+
+func newTestServerWithStore(t *testing.T) (http.Handler, store.Store) {
 	t.Helper()
 	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "boards.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
-	return New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil))), st
 }
 
 func do(t *testing.T, h http.Handler, method, path, participant string, body any) (*httptest.ResponseRecorder, map[string]any) {
@@ -250,6 +258,65 @@ func TestActionsFlow(t *testing.T) {
 	}
 	if rec, _ = do(t, h, "DELETE", "/api/boards/"+id+"/actions/nope", owner, nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("удаление несуществующего решения: %d", rec.Code)
+	}
+}
+
+// setTimerEnd выставляет конец таймера напрямую в хранилище: через API
+// минимальный таймер — минута, а тесту нужны миллисекунды и прошлое.
+func setTimerEnd(t *testing.T, st store.Store, id string, at time.Time) {
+	t.Helper()
+	if _, err := st.Update(id, func(b *model.Board) error {
+		b.TimerEndsAt = &at
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTimerAutoAdvance(t *testing.T) {
+	h, st := newTestServerWithStore(t)
+	const owner, bob = "owner-00000001", "bob-0000000001"
+	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Таймер", "template": "classic"})
+	id := out["id"].(string)
+
+	// Истёкший таймер (например, после рестарта сервера) применяется при
+	// первом же чтении доски: запись → показ, таймер снят.
+	setTimerEnd(t, st, id, time.Now().Add(-time.Minute))
+	_, out = do(t, h, "GET", "/api/boards/"+id, bob, nil)
+	if out["phase"] != "reveal" || out["timerEndsAt"] != nil {
+		t.Fatalf("истёкший таймер должен перевести доску в показ: phase=%v ends=%v", out["phase"], out["timerEndsAt"])
+	}
+
+	// Идущий таймер планируется и срабатывает сам, без запросов.
+	setTimerEnd(t, st, id, time.Now().Add(60*time.Millisecond))
+	do(t, h, "GET", "/api/boards/"+id, bob, nil) // чтение ставит таймер в планировщик
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		b, err := st.Get(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Phase == model.PhaseVote && b.TimerEndsAt == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("таймер не сработал сам: phase=%s ends=%v", b.Phase, b.TimerEndsAt)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Ручная смена фазы снимает таймер, и запланированное срабатывание
+	// ничего не меняет.
+	setTimerEnd(t, st, id, time.Now().Add(60*time.Millisecond))
+	do(t, h, "GET", "/api/boards/"+id, bob, nil)
+	do(t, h, "POST", "/api/boards/"+id+"/phase", owner, map[string]any{"phase": "reveal"})
+	time.Sleep(150 * time.Millisecond)
+	b, err := st.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Phase != model.PhaseReveal || b.TimerEndsAt != nil {
+		t.Fatalf("после ручной смены фазы таймер не должен срабатывать: phase=%s ends=%v", b.Phase, b.TimerEndsAt)
 	}
 }
 

@@ -36,6 +36,16 @@ func (p Phase) Valid() bool {
 	return false
 }
 
+// Next — следующая фаза по порядку; false для последней.
+func (p Phase) Next() (Phase, bool) {
+	for i, q := range Phases {
+		if p == q && i+1 < len(Phases) {
+			return Phases[i+1], true
+		}
+	}
+	return "", false
+}
+
 // Ограничения на ввод.
 const (
 	MaxTitleLen      = 120
@@ -627,6 +637,21 @@ func (b *Board) DeleteAction(actionID, actorID string) error {
 		}
 	}
 	return nil
+}
+
+// ExpireTimer применяет истечение таймера: если таймер задан и now не раньше
+// его конца, доска переходит на следующий этап (на последнем остаётся), а
+// таймер снимается. Возвращает true, если доска изменилась. Права не
+// проверяются: это следствие решения ведущего, принятого при запуске таймера.
+func (b *Board) ExpireTimer(now time.Time) bool {
+	if b.TimerEndsAt == nil || now.Before(*b.TimerEndsAt) {
+		return false
+	}
+	b.TimerEndsAt = nil
+	if next, ok := b.Phase.Next(); ok {
+		b.Phase = next
+	}
+	return true
 }
 
 // SetTimer запускает таймер фазы на minutes минут от now. Только ведущий.

@@ -378,7 +378,8 @@ function renderBoardPage(root, id) {
       timerEl.className = 'timer over';
       if (timerNotified !== ends) {
         timerNotified = ends;
-        toast('Время фазы вышло');
+        // Сервер сам переключит этап и пришлёт обновление доски.
+        toast(board.phase === 'discuss' ? 'Время вышло' : 'Время вышло — переходим к следующему этапу');
       }
     } else {
       const m = Math.floor(left / 60);
@@ -485,7 +486,13 @@ function renderBoardPage(root, id) {
           dataset: { keep: 'timer' }, 'aria-label': 'Минуты таймера',
           onchange: e => store(TIMER_KEY, e.target.value),
         });
-        items.push(h('span', { class: 'tool' }, 'Таймер, мин', minutes,
+        const nextPhase = PHASES[PHASES.findIndex(p => p.id === board.phase) + 1];
+        items.push(h('span', {
+          class: 'tool',
+          title: nextPhase
+            ? `По истечении доска сама перейдёт к этапу «${nextPhase.label}»`
+            : 'На последнем этапе таймер только отсчитывает время',
+        }, 'Таймер, мин', minutes,
           h('button', {
             type: 'button',
             onclick: () => setTimer(parseInt(minutes.value, 10) || 0),
