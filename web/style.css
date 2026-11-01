@@ -118,7 +118,7 @@ input[type=text], input[type=number], select, textarea {
   font-size: 13px;
   color: var(--muted);
 }
-.tool { display: inline-flex; align-items: center; gap: 6px; }
+.tool { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .tool input[type=text] { width: 130px; padding: 5px 8px; font-size: 13px; }
 .tool input[type=number] { width: 56px; padding: 5px 6px; font-size: 13px; }
 .tool.check input { margin: 0; }
@@ -173,6 +173,10 @@ button.phase:hover:not(:disabled) { border-color: var(--accent); color: var(--in
   font-size: 14px;
 }
 .hint { margin: 0; }
+.timer { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timer.soon { color: var(--danger); }
+.timer.over { color: var(--danger); font-weight: 600; }
+.timer[hidden] { display: none; }
 .status { color: var(--danger); }
 .status[hidden] { display: none; }
 

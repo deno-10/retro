@@ -108,3 +108,32 @@ func TestBoardFlow(t *testing.T) {
 		t.Fatalf("короткий идентификатор участника: %d", rec.Code)
 	}
 }
+
+func TestTimerEndpoint(t *testing.T) {
+	h := newTestServer(t)
+	const owner, bob = "owner-00000001", "bob-0000000001"
+
+	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Таймер", "template": "classic"})
+	id := out["id"].(string)
+
+	rec, _ := do(t, h, "POST", "/api/boards/"+id+"/timer", bob, map[string]any{"minutes": 5})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("таймер не ведущим: %d", rec.Code)
+	}
+	rec, _ = do(t, h, "POST", "/api/boards/"+id+"/timer", owner, map[string]any{"minutes": 500})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("слишком долгий таймер: %d", rec.Code)
+	}
+	rec, out = do(t, h, "POST", "/api/boards/"+id+"/timer", owner, map[string]any{"minutes": 5})
+	if rec.Code != http.StatusOK || out["timerEndsAt"] == nil {
+		t.Fatalf("запуск таймера: %d %s", rec.Code, rec.Body)
+	}
+	_, out = do(t, h, "GET", "/api/boards/"+id, bob, nil)
+	if out["timerEndsAt"] == nil {
+		t.Fatal("участник должен видеть таймер")
+	}
+	rec, out = do(t, h, "POST", "/api/boards/"+id+"/timer", owner, map[string]any{"minutes": 0})
+	if rec.Code != http.StatusOK || out["timerEndsAt"] != nil {
+		t.Fatalf("остановка таймера: %d %s", rec.Code, rec.Body)
+	}
+}

@@ -3,6 +3,7 @@ package model
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestBoard(t *testing.T) *Board {
@@ -152,6 +153,42 @@ func TestDiscussSortsByVotes(t *testing.T) {
 	}
 	if md := b.Markdown(); !containsAll(md, "## Что было хорошо", "- вторая (2 голоса)", "- первая (1 голос)") {
 		t.Fatalf("неожиданный markdown:\n%s", md)
+	}
+}
+
+func TestTimer(t *testing.T) {
+	b := newTestBoard(t)
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	if err := b.SetTimer(5, now, "bob"); err != ErrForbidden {
+		t.Fatalf("таймер ставит только ведущий, получено %v", err)
+	}
+	if err := b.SetTimer(MaxTimerMinutes+1, now, "owner-1"); err == nil {
+		t.Fatal("слишком долгий таймер должен давать ошибку")
+	}
+	if err := b.SetTimer(-1, now, "owner-1"); err == nil {
+		t.Fatal("отрицательный таймер должен давать ошибку")
+	}
+	if err := b.SetTimer(5, now, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	want := now.Add(5 * time.Minute)
+	if b.TimerEndsAt == nil || !b.TimerEndsAt.Equal(want) {
+		t.Fatalf("ожидался конец таймера %v, получено %v", want, b.TimerEndsAt)
+	}
+	if v := b.View("bob"); v.TimerEndsAt == nil || !v.TimerEndsAt.Equal(want) {
+		t.Fatalf("таймер должен быть виден всем участникам: %+v", v.TimerEndsAt)
+	}
+	if err := b.SetTimer(0, now, "owner-1"); err != nil || b.TimerEndsAt != nil {
+		t.Fatalf("ноль минут должен останавливать таймер: err=%v ends=%v", err, b.TimerEndsAt)
+	}
+	if err := b.SetTimer(3, now, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetPhase(PhaseWrite, "owner-1"); err != nil || b.TimerEndsAt == nil {
+		t.Fatalf("повторный выбор той же фазы не должен сбрасывать таймер: err=%v", err)
+	}
+	if err := b.SetPhase(PhaseReveal, "owner-1"); err != nil || b.TimerEndsAt != nil {
+		t.Fatalf("смена фазы должна сбрасывать таймер: err=%v ends=%v", err, b.TimerEndsAt)
 	}
 }
 

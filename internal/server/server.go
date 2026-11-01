@@ -42,6 +42,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handle
 	m.HandleFunc("GET /api/boards/{id}/export.md", s.handleExport)
 	m.HandleFunc("POST /api/boards/{id}/phase", s.handleSetPhase)
 	m.HandleFunc("POST /api/boards/{id}/vote-limit", s.handleSetVoteLimit)
+	m.HandleFunc("POST /api/boards/{id}/timer", s.handleSetTimer)
 	m.HandleFunc("POST /api/boards/{id}/cards", s.handleAddCard)
 	m.HandleFunc("PATCH /api/boards/{id}/cards/{cardId}", s.handleEditCard)
 	m.HandleFunc("DELETE /api/boards/{id}/cards/{cardId}", s.handleDeleteCard)
@@ -240,6 +241,19 @@ func (s *Server) handleSetVoteLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mutate(w, r, func(b *model.Board, pid string) error {
 		return b.SetVoteLimit(in.VoteLimit, pid)
+	})
+}
+
+func (s *Server) handleSetTimer(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Minutes int `json:"minutes"`
+	}
+	if err := decode(w, r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.mutate(w, r, func(b *model.Board, pid string) error {
+		return b.SetTimer(in.Minutes, time.Now(), pid)
 	})
 }
 

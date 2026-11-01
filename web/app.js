@@ -6,6 +6,7 @@ const PID_KEY = 'retro.participant';
 const NAME_KEY = 'retro.name';
 const ANON_KEY = 'retro.anonymous';
 const RECENT_KEY = 'retro.recent';
+const TIMER_KEY = 'retro.timer';
 
 function stored(key, fallback) {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -211,6 +212,7 @@ function renderBoardPage(root, id) {
   const phaseNav = h('nav', { class: 'phases', 'aria-label': 'Фазы ретро' });
   const toolsEl = h('div', { class: 'tools' });
   const hintEl = h('p', { class: 'hint' });
+  const timerEl = h('span', { class: 'timer', role: 'timer', hidden: true });
   const statusEl = h('span', { class: 'status', hidden: true });
   const columnsEl = h('main', { class: 'columns' });
 
@@ -220,7 +222,7 @@ function renderBoardPage(root, id) {
       phaseNav,
       toolsEl,
     ),
-    h('div', { class: 'statusline' }, hintEl, statusEl),
+    h('div', { class: 'statusline' }, hintEl, timerEl, statusEl),
     columnsEl,
   );
 
@@ -253,6 +255,12 @@ function renderBoardPage(root, id) {
 
   async function vote(cardId) {
     try { await api('POST', `/api/boards/${board.id}/cards/${cardId}/vote`); }
+    catch (err) { toast(err.message); }
+  }
+
+  // minutes === 0 останавливает таймер.
+  async function setTimer(minutes) {
+    try { await api('POST', `/api/boards/${board.id}/timer`, { minutes }); }
     catch (err) { toast(err.message); }
   }
 
@@ -290,9 +298,44 @@ function renderBoardPage(root, id) {
     const scrollLeft = columnsEl.scrollLeft;
     renderPhases();
     renderTools();
+    renderTimer();
     renderColumns();
     columnsEl.scrollLeft = scrollLeft;
     restoreFocus(saved);
+  }
+
+  // Таймер считает на клиенте от timerEndsAt, который приходит с сервера и
+  // одинаков для всех. Часы сервера и браузера могут расходиться на секунды —
+  // для ретро это не важно. Тикает только текст таймера, не вся доска.
+  let timerInterval = null;
+  let timerNotified = null; // timerEndsAt, о котором уже сообщили «время вышло»
+
+  function renderTimer() {
+    const ends = board && board.timerEndsAt;
+    if (!ends) {
+      clearInterval(timerInterval);
+      timerInterval = null;
+      timerEl.hidden = true;
+      return;
+    }
+    const left = Math.round((new Date(ends) - Date.now()) / 1000);
+    if (left <= 0) {
+      clearInterval(timerInterval);
+      timerInterval = null;
+      timerEl.textContent = 'Время вышло';
+      timerEl.className = 'timer over';
+      if (timerNotified !== ends) {
+        timerNotified = ends;
+        toast('Время фазы вышло');
+      }
+    } else {
+      const m = Math.floor(left / 60);
+      const s = String(left % 60).padStart(2, '0');
+      timerEl.textContent = `Осталось ${m}:${s}`;
+      timerEl.className = 'timer' + (left <= 60 ? ' soon' : '');
+      if (!timerInterval) timerInterval = setInterval(renderTimer, 1000);
+    }
+    timerEl.hidden = false;
   }
 
   function renderPhases() {
@@ -341,6 +384,22 @@ function renderBoardPage(root, id) {
           type: 'number', min: 1, max: 20, value: board.voteLimit,
           dataset: { keep: 'limit' }, onchange: e => setVoteLimit(e.target.value),
         })));
+    }
+    if (board.isOwner) {
+      if (board.timerEndsAt) {
+        items.push(h('button', { type: 'button', class: 'tool', onclick: () => setTimer(0) }, 'Остановить таймер'));
+      } else {
+        const minutes = h('input', {
+          type: 'number', min: 1, max: 120, value: stored(TIMER_KEY, '5'),
+          dataset: { keep: 'timer' }, 'aria-label': 'Минуты таймера',
+          onchange: e => store(TIMER_KEY, e.target.value),
+        });
+        items.push(h('span', { class: 'tool' }, 'Таймер, мин', minutes,
+          h('button', {
+            type: 'button',
+            onclick: () => setTimer(parseInt(minutes.value, 10) || 0),
+          }, 'Запустить')));
+      }
     }
     items.push(h('span', { class: 'tool' }, `Онлайн: ${online}`));
     if (board.phase !== 'write') {

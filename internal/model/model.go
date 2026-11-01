@@ -43,6 +43,7 @@ const (
 	MaxNameLen       = 60
 	DefaultVoteLimit = 5
 	MaxVoteLimit     = 20
+	MaxTimerMinutes  = 120
 )
 
 // Ошибки предметной области. HTTP-слой превращает их в коды ответа.
@@ -56,15 +57,18 @@ var (
 
 // Board — доска одного ретро.
 type Board struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Template  string    `json:"template"`
-	OwnerID   string    `json:"ownerId"` // ведущий: создатель доски
-	Phase     Phase     `json:"phase"`
-	VoteLimit int       `json:"voteLimit"` // голосов на участника
-	Columns   []Column  `json:"columns"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Template  string `json:"template"`
+	OwnerID   string `json:"ownerId"` // ведущий: создатель доски
+	Phase     Phase  `json:"phase"`
+	VoteLimit int    `json:"voteLimit"` // голосов на участника
+	// TimerEndsAt — конец таймера текущей фазы; nil — таймер не запущен.
+	// Таймер только информирует: фазу по его истечении переключает ведущий.
+	TimerEndsAt *time.Time `json:"timerEndsAt,omitempty"`
+	Columns     []Column   `json:"columns"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	UpdatedAt   time.Time  `json:"updatedAt"`
 }
 
 // Column — колонка доски.
@@ -302,7 +306,28 @@ func (b *Board) SetPhase(p Phase, actorID string) error {
 	if !p.Valid() {
 		return fmt.Errorf("%w: неизвестная фаза %q", ErrInvalid, string(p))
 	}
+	if p != b.Phase {
+		b.TimerEndsAt = nil // таймер относится к фазе и вместе с ней заканчивается
+	}
 	b.Phase = p
+	return nil
+}
+
+// SetTimer запускает таймер фазы на minutes минут от now. Только ведущий.
+// minutes == 0 останавливает таймер.
+func (b *Board) SetTimer(minutes int, now time.Time, actorID string) error {
+	if actorID != b.OwnerID {
+		return ErrForbidden
+	}
+	if minutes < 0 || minutes > MaxTimerMinutes {
+		return fmt.Errorf("%w: таймер от 1 до %d минут, 0 — остановить", ErrInvalid, MaxTimerMinutes)
+	}
+	if minutes == 0 {
+		b.TimerEndsAt = nil
+		return nil
+	}
+	ends := now.Add(time.Duration(minutes) * time.Minute)
+	b.TimerEndsAt = &ends
 	return nil
 }
 
@@ -321,14 +346,15 @@ func (b *Board) SetVoteLimit(n int, actorID string) error {
 // BoardView — доска глазами конкретного участника: чужие карточки в фазе
 // записи скрыты, голоса видны только с фазы голосования.
 type BoardView struct {
-	ID        string       `json:"id"`
-	Title     string       `json:"title"`
-	Phase     Phase        `json:"phase"`
-	VoteLimit int          `json:"voteLimit"`
-	VotesLeft int          `json:"votesLeft"`
-	IsOwner   bool         `json:"isOwner"`
-	Columns   []ColumnView `json:"columns"`
-	UpdatedAt time.Time    `json:"updatedAt"`
+	ID          string       `json:"id"`
+	Title       string       `json:"title"`
+	Phase       Phase        `json:"phase"`
+	VoteLimit   int          `json:"voteLimit"`
+	VotesLeft   int          `json:"votesLeft"`
+	IsOwner     bool         `json:"isOwner"`
+	TimerEndsAt *time.Time   `json:"timerEndsAt,omitempty"`
+	Columns     []ColumnView `json:"columns"`
+	UpdatedAt   time.Time    `json:"updatedAt"`
 }
 
 // ColumnView — колонка в представлении участника.
@@ -353,14 +379,15 @@ type CardView struct {
 func (b *Board) View(viewer string) BoardView {
 	showVotes := b.Phase == PhaseVote || b.Phase == PhaseDiscuss
 	v := BoardView{
-		ID:        b.ID,
-		Title:     b.Title,
-		Phase:     b.Phase,
-		VoteLimit: b.VoteLimit,
-		VotesLeft: b.VoteLimit - b.VotesUsed(viewer),
-		IsOwner:   viewer == b.OwnerID,
-		Columns:   make([]ColumnView, 0, len(b.Columns)),
-		UpdatedAt: b.UpdatedAt,
+		ID:          b.ID,
+		Title:       b.Title,
+		Phase:       b.Phase,
+		VoteLimit:   b.VoteLimit,
+		VotesLeft:   b.VoteLimit - b.VotesUsed(viewer),
+		IsOwner:     viewer == b.OwnerID,
+		TimerEndsAt: b.TimerEndsAt,
+		Columns:     make([]ColumnView, 0, len(b.Columns)),
+		UpdatedAt:   b.UpdatedAt,
 	}
 	if v.VotesLeft < 0 {
 		v.VotesLeft = 0
