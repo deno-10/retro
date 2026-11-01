@@ -1,10 +1,10 @@
 // Package store — хранилище досок. Интерфейс Store один, реализации
-// подменяются: сейчас JSON-файл, дальше SQLite и Postgres.
+// подменяются: SQLite (по умолчанию) и JSON-файл (прежний формат); дальше
+// тем же путём Postgres.
 package store
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,19 +38,9 @@ type JSONStore struct {
 // OpenJSON открывает хранилище. Отсутствующий файл — нормальный первый запуск.
 func OpenJSON(path string) (*JSONStore, error) {
 	s := &JSONStore{path: path, boards: map[string]*model.Board{}}
-	data, err := os.ReadFile(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return s, nil
-	case err != nil:
+	list, err := readJSONBoards(path)
+	if err != nil {
 		return nil, err
-	}
-	if len(data) == 0 {
-		return s, nil
-	}
-	var list []*model.Board
-	if err := json.Unmarshal(data, &list); err != nil {
-		return nil, fmt.Errorf("разбор %s: %w", path, err)
 	}
 	for _, b := range list {
 		s.boards[b.ID] = b

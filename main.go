@@ -1,7 +1,8 @@
 // Retro — доска для ретроспектив спринта. Один бинарник: API, SSE и статика.
 //
-//	go run .                       # http://localhost:8080
-//	go run . -addr :9000 -data /var/lib/retro/boards.json
+//	go run .                       # http://localhost:8080, данные в data/retro.db
+//	go run . -addr :9000 -data /var/lib/retro/retro.db
+//	go run . -data data/boards.json  # прежнее JSON-хранилище
 package main
 
 import (
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -27,12 +29,12 @@ var webFS embed.FS
 
 func main() {
 	addr := flag.String("addr", ":8080", "адрес, на котором слушать")
-	dataFile := flag.String("data", "data/boards.json", "файл с данными досок")
+	dataFile := flag.String("data", "data/retro.db", "файл с данными досок: SQLite, либо .json для прежнего формата")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	st, err := store.OpenJSON(*dataFile)
+	st, err := openStore(*dataFile, logger)
 	if err != nil {
 		logger.Error("не удалось открыть хранилище", "err", err)
 		os.Exit(1)
@@ -71,4 +73,37 @@ func main() {
 		logger.Error("остановка с ошибкой", "err", err)
 	}
 	logger.Info("retro остановлен")
+}
+
+// openStore открывает хранилище по пути. Для SQLite при пустой базе один раз
+// импортирует доски из boards.json, лежащего в том же каталоге, — так старые
+// установки переезжают на новый формат без ручных действий. Импорт не
+// повторится: после него база уже не пуста.
+func openStore(path string, logger *slog.Logger) (store.Store, error) {
+	st, err := store.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	sq, ok := st.(*store.SQLiteStore)
+	if !ok {
+		return st, nil
+	}
+	empty, err := sq.Empty()
+	if err != nil {
+		sq.Close()
+		return nil, err
+	}
+	if !empty {
+		return st, nil
+	}
+	legacy := filepath.Join(filepath.Dir(path), "boards.json")
+	n, err := store.ImportJSON(sq, legacy)
+	if err != nil {
+		sq.Close()
+		return nil, err
+	}
+	if n > 0 {
+		logger.Info("доски импортированы из JSON", "from", legacy, "count", n)
+	}
+	return st, nil
 }

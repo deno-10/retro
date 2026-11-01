@@ -8,13 +8,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Retro is a sprint-retrospective board: a single Go binary (stdlib only, no external modules) serving a REST API, Server-Sent Events, and an embedded vanilla-JS frontend. Code comments, log messages, error strings, tests and the README are written in **Russian**; keep new comments, user-facing strings and test failure messages in Russian to match.
+Retro is a sprint-retrospective board: a single Go binary (the only dependency is the pure-Go `modernc.org/sqlite` driver, no CGO) serving a REST API, Server-Sent Events, and an embedded vanilla-JS frontend. Code comments, log messages, error strings, tests and the README are written in **Russian**; keep new comments, user-facing strings and test failure messages in Russian to match.
 
 ## Commands
 
 ```bash
-go run .                                   # serve on http://localhost:8080, data in data/boards.json
-go run . -addr :9000 -data /path/boards.json
+go run .                                   # serve on http://localhost:8080, data in data/retro.db (SQLite)
+go run . -addr :9000 -data /path/retro.db
+go run . -data data/boards.json            # legacy JSON store, chosen by the .json extension
 go test ./...                              # all tests
 go test ./internal/model -run TestVoteLimit   # a single test
 go vet ./...
@@ -22,9 +23,9 @@ go build -o retro .
 docker build -t retro . && docker run -d -p 8080:8080 -v retro-data:/app/data retro
 ```
 
-Go 1.22+ is required: routing uses `net/http` method+pattern muxing (`"GET /api/boards/{id}"`, `r.PathValue`) and `http.FileServerFS`. There is no frontend build step; `web/` is served as-is via `//go:embed`, so changes to `web/*` require restarting the Go process (a browser reload alone is not enough).
+Go 1.26+ is required (`go.mod` pins it because `modernc.org/sqlite` needs it; `GOTOOLCHAIN=auto` downloads it). Routing uses `net/http` method+pattern muxing (`"GET /api/boards/{id}"`, `r.PathValue`) and `http.FileServerFS`. There is no frontend build step; `web/` is served as-is via `//go:embed`, so changes to `web/*` require restarting the Go process (a browser reload alone is not enough).
 
-`data/` and the `retro` binary are gitignored. Tests use `t.TempDir()` and never touch `data/boards.json`.
+`data/` and the `retro` binary are gitignored. Tests use `t.TempDir()` and never touch `data/`.
 
 **Before finishing any task, both `go vet ./...` and `go test ./...` must pass.** Run them and fix failures; do not report a task as done while either is red.
 
@@ -38,7 +39,7 @@ Four packages with strict dependency direction: `server → store, hub, model`; 
 
 - **`internal/model`** holds every business rule and no I/O: phases (`write → reveal → vote → discuss`), permissions (owner vs. author), vote limits, templates, input limits. All mutation methods on `Board` take an `actorID`/`participantID` and enforce rights themselves. Sentinel errors (`ErrNotFound`, `ErrForbidden`, `ErrPhase`, `ErrVotes`, `ErrInvalid`) are wrapped with `%w`; the server maps them to 404/403/409/409/400 in `writeErr`. Any new rule or error kind belongs here first.
 - **`Board.View(viewer)`** is the only thing the API ever returns to clients. It is where privacy is enforced server-side: in `write` phase other participants' cards come back with `hidden: true` and empty text/author; vote counts appear only from `vote` phase; cards sort by votes in `discuss`. Never serialize a raw `Board` to a client.
-- **`internal/store`** defines the `Store` interface (`Create`, `Get`, `Update`, `Close`). `Get` returns a deep copy (via JSON round-trip in `clone`). `Update(id, fn)` applies `fn` to a copy under a mutex and commits only if `fn` returns nil, then rewrites the whole JSON file atomically (tmp file + rename). The README's roadmap plans SQLite/Postgres as additional `Store` implementations, so keep callers on the interface.
+- **`internal/store`** defines the `Store` interface (`Create`, `Get`, `Update`, `Close`) with two implementations chosen by `store.Open(path)` on file extension. `SQLiteStore` (default, `sqlite.go`) keeps each board as a JSON document in `boards(id, data, created_at, updated_at)`, uses a single pooled connection with WAL and `busy_timeout`, and runs `Update` inside a transaction that rolls back when `fn` errors. `JSONStore` (`store.go`) is the legacy format: in-memory map under a mutex, whole file rewritten atomically on each change. Both return deep copies from `Get`/`Update` and commit only if `fn` returns nil. `ImportJSON` copies a JSON file into any `Store`; `main.go` calls it once when a fresh SQLite DB has a `boards.json` beside it. Keep callers on the interface so Postgres can be added the same way.
 - **`internal/hub`** is an in-process pub/sub keyed by board ID that carries no payload. `Notify` is non-blocking and coalesces (buffer of 1). Subscribers re-read the board from the store and rebuild their own `View`. `Hub.Done()`/`Close()` let `main` terminate SSE streams before `http.Server.Shutdown`.
 - **`internal/server`** is thin. Every write endpoint goes through `Server.mutate`, which does: resolve participant → `store.Update` → `hub.Notify` → respond with `View`. New mutation endpoints should follow that pattern rather than hand-rolling the sequence. `handleEvents` is the SSE loop: it sends the full `BoardView` plus an `online` count on every signal and a `: ping` comment every 25 s. `withLogging` deliberately does not wrap the `ResponseWriter` because doing so would hide `http.Flusher` and break SSE.
 

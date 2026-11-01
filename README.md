@@ -10,17 +10,20 @@
 - Голосование точками, лимит на участника задаёт ведущий.
 - Изменения видны всем сразу (SSE), счётчик участников онлайн.
 - Экспорт доски в Markdown.
-- Хранение: JSON-файл `data/boards.json`.
+- Хранение: SQLite в `data/retro.db` (драйвер `modernc.org/sqlite` на чистом Go, без CGO). Прежний JSON-файл по-прежнему поддерживается, а при первом запуске с пустой базой доски из лежащего рядом `boards.json` импортируются автоматически.
 
 ## Запуск
 
-Нужен Go 1.22+.
+Нужен Go 1.26+ (с `GOTOOLCHAIN=auto` нужная версия подтянется сама).
 
 ```
-go run .                                   # http://localhost:8080
+go run .                                   # http://localhost:8080, данные в data/retro.db
 go test ./...
-go build -o retro . && ./retro -addr :8080 -data /var/lib/retro/boards.json
+go build -o retro . && ./retro -addr :8080 -data /var/lib/retro/retro.db
+./retro -data data/boards.json             # прежнее JSON-хранилище
 ```
+
+Хранилище выбирается по расширению файла в `-data`: `.json` — JSON-файл, всё остальное — SQLite.
 
 Docker:
 
@@ -34,7 +37,7 @@ docker run -d -p 8080:8080 -v retro-data:/app/data --name retro retro
 ```
 main.go              точка входа, флаги, embed web/
 internal/model       предметная область: доска, фазы, голоса, права — без HTTP и БД
-internal/store       интерфейс Store и JSON-реализация
+internal/store       интерфейс Store, реализации SQLite и JSON, импорт из JSON
 internal/hub         подписки SSE по доскам
 internal/server      HTTP: REST, SSE, статика
 web/                 index.html, app.js, style.css
@@ -70,7 +73,7 @@ web/                 index.html, app.js, style.css
 
 ## Дальше
 
-1. SQLite (`modernc.org/sqlite`, без CGO): таблица `boards(id, data, created_at, updated_at)`, доска — JSON-документ. Это новая реализация интерфейса `Store`, остальной код не меняется. Postgres (`jsonb`) — тем же путём.
+1. Postgres (`jsonb`) как ещё одна реализация `Store` — для нескольких реплик, вместе с внешним pub/sub вместо хаба в памяти. SQLite уже есть: таблица `boards(id, data, created_at, updated_at)`, доска — JSON-документ.
 2. SSO по OIDC (Okta / Azure AD / Keycloak): участник = `sub` из токена, роль ведущего переживает смену браузера.
 3. Группировка карточек drag-and-drop.
 4. Action items с ответственным и переносом в следующее ретро; история досок команды.
@@ -79,5 +82,6 @@ web/                 index.html, app.js, style.css
 ## Ограничения
 
 - Один инстанс: подписки живут в памяти процесса. Для нескольких реплик нужен Redis pub/sub или липкие сессии на балансировщике.
-- JSON-файл переписывается целиком при каждом изменении — для десятков досок это незаметно, для тысяч нужен SQLite.
+- SQLite — файл на одном узле: несколько реплик с общей базой невозможны, для этого нужен Postgres.
+- В режиме `.json` файл переписывается целиком при каждом изменении — для десятков досок это незаметно, для тысяч используйте SQLite.
 - Тексты карточек никак не модерируются; максимум 2000 символов.
