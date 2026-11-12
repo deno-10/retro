@@ -20,7 +20,7 @@ func Open(path string) (Store, error) {
 	return OpenSQLite(path)
 }
 
-// ImportJSON читает доски из файла в формате JSONStore и добавляет их в dst.
+// ImportJSON читает доски из файла в формате JSONStore и атомарно добавляет их в dst.
 // Возвращает число добавленных досок. Отсутствующий или пустой файл — ноль
 // досок без ошибки.
 func ImportJSON(dst Store, path string) (int, error) {
@@ -28,10 +28,8 @@ func ImportJSON(dst Store, path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	for i, b := range boards {
-		if err := dst.Create(b); err != nil {
-			return i, fmt.Errorf("импорт доски %s: %w", b.ID, err)
-		}
+	if err := dst.CreateMany(boards); err != nil {
+		return 0, fmt.Errorf("импорт досок: %w", err)
 	}
 	return len(boards), nil
 }

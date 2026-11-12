@@ -3,6 +3,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,11 +31,23 @@ type Server struct {
 	// Планировщик живёт в памяти процесса; после рестарта таймеры
 	// восстанавливаются лениво — при первом чтении доски (syncTimer).
 	mu     sync.Mutex
-	timers map[string]*time.Timer
+	timers map[string]*phaseTimer
+}
+
+// phaseTimer — отдельное поколение таймера. Даже уже запущенный callback
+// не может изменить планировщик, если эту запись успели заменить или снять.
+type phaseTimer struct {
+	timer  *time.Timer
+	retry  *time.Timer
+	endsAt time.Time
 }
 
 // errTimerNotDue — таймер ещё не истёк (или уже снят): Update откатывается.
 var errTimerNotDue = errors.New("таймер ещё не истёк")
+
+// errMutationReplayed откатывает пустой Update: повтор уже сохранённой
+// операции не должен менять revision и UpdatedAt доски.
+var errMutationReplayed = errors.New("операция уже применена")
 
 // New собирает маршрутизатор. static — содержимое каталога web/.
 func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handler {
@@ -42,7 +55,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handle
 	if err != nil {
 		panic("web/index.html не найден: " + err.Error())
 	}
-	s := &Server{store: st, hub: h, log: log, index: index, timers: map[string]*time.Timer{}}
+	s := &Server{store: st, hub: h, log: log, index: index, timers: map[string]*phaseTimer{}}
 
 	m := http.NewServeMux()
 	m.HandleFunc("GET /api/templates", s.handleTemplates)
@@ -64,7 +77,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handle
 	m.HandleFunc("POST /api/boards/{id}/actions", s.handleAddAction)
 	m.HandleFunc("PATCH /api/boards/{id}/actions/{actionId}", s.handleEditAction)
 	m.HandleFunc("DELETE /api/boards/{id}/actions/{actionId}", s.handleDeleteAction)
-	m.HandleFunc("POST /api/boards/{id}/actions/{actionId}/done", s.handleToggleActionDone)
+	m.HandleFunc("POST /api/boards/{id}/actions/{actionId}/done", s.handleSetActionDone)
 
 	m.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(static)))
 	m.HandleFunc("GET /b/{id}", s.handleIndex)
@@ -96,7 +109,17 @@ func participant(r *http.Request) (string, error) {
 
 func decode(w http.ResponseWriter, r *http.Request, v any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(v); err != nil {
+		return fmt.Errorf("%w: тело запроса не разобрано (%v)", model.ErrInvalid, err)
+	}
+	// Дочитываем всё тело до мутации: допустим только пробельный остаток,
+	// который также входит в ограничение размера запроса.
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("%w: тело запроса должно содержать одно значение JSON", model.ErrInvalid)
+		}
 		return fmt.Errorf("%w: тело запроса не разобрано (%v)", model.ErrInvalid, err)
 	}
 	return nil
@@ -115,7 +138,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case errors.Is(err, model.ErrForbidden):
 		status = http.StatusForbidden
-	case errors.Is(err, model.ErrPhase), errors.Is(err, model.ErrVotes):
+	case errors.Is(err, model.ErrPhase), errors.Is(err, model.ErrVotes), errors.Is(err, model.ErrConflict):
 		status = http.StatusConflict
 	case errors.Is(err, model.ErrInvalid):
 		status = http.StatusBadRequest
@@ -137,73 +160,219 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn func(b *model
 		return
 	}
 	id := r.PathValue("id")
-	b, err := s.store.Update(id, func(bd *model.Board) error { return fn(bd, pid) })
+	var operationErr error
+	b, err := s.store.Update(id, func(bd *model.Board) error {
+		// Дедлайн проверяется после получения блокировки/транзакции Store,
+		// чтобы ожидавший записи запрос не воспользовался уже истёкшей фазой.
+		if !bd.ExpireTimer(time.Now()) {
+			return fn(bd, pid)
+		}
+		// Истечение нужно сохранить даже при отказе в самой операции.
+		// Изолируем её изменения: callback может изменить доску до ошибки.
+		data, err := json.Marshal(bd)
+		if err != nil {
+			return err
+		}
+		var candidate model.Board
+		if err := json.Unmarshal(data, &candidate); err != nil {
+			return err
+		}
+		operationErr = fn(&candidate, pid)
+		if operationErr == nil {
+			*bd = candidate
+		}
+		return nil
+	})
+	replayed := errors.Is(err, errMutationReplayed)
+	if replayed {
+		b, err = s.store.Get(id)
+	}
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	s.hub.Notify(id)
+	if !replayed {
+		s.hub.Notify(id)
+	}
 	b = s.syncTimer(b)
+	if operationErr != nil && !errors.Is(operationErr, errMutationReplayed) {
+		s.writeErr(w, operationErr)
+		return
+	}
 	writeJSON(w, http.StatusOK, b.View(pid))
+}
+
+// mutateOnce сохраняет результат создания и ключ повтора в том же Update.
+// Без заголовка остаётся прежнее поведение API. Квитанции не удаляются вместе
+// с карточкой или решением: поздний повтор не должен воскресить удалённое.
+func (s *Server) mutateOnce(w http.ResponseWriter, r *http.Request, operation string, payload any, fn func(*model.Board, string) error) {
+	keys := r.Header.Values("Idempotency-Key")
+	if len(keys) == 0 {
+		s.mutate(w, r, fn)
+		return
+	}
+	if len(keys) != 1 || !validIdempotencyKey(keys[0]) {
+		s.writeErr(w, fmt.Errorf("%w: Idempotency-Key должен содержать 8–64 символа A–Z, a–z, 0–9 или дефис", model.ErrInvalid))
+		return
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(data))
+	s.mutate(w, r, func(b *model.Board, pid string) error {
+		key := pid + ":" + keys[0]
+		if receipt, exists := b.Receipts[key]; exists {
+			if receipt.Operation != operation || receipt.Fingerprint != fingerprint {
+				return fmt.Errorf("%w: Idempotency-Key уже использован для другого запроса", model.ErrConflict)
+			}
+			return errMutationReplayed
+		}
+		if err := fn(b, pid); err != nil {
+			return err
+		}
+		if b.Receipts == nil {
+			b.Receipts = make(map[string]model.MutationReceipt)
+		}
+		b.Receipts[key] = model.MutationReceipt{Operation: operation, Fingerprint: fingerprint}
+		return nil
+	})
+}
+
+func validIdempotencyKey(key string) bool {
+	if len(key) < 8 || len(key) > 64 {
+		return false
+	}
+	for _, c := range key {
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // --- таймер фазы: автоматический переход на следующий этап ---
 
-// syncTimer приводит планировщик в соответствие с доской: таймера нет —
-// отменить запланированное; уже истёк — применить сейчас; идёт — назначить
-// срабатывание. Возвращает доску после возможного применения.
+// syncTimer перечитывает доску под блокировкой планировщика: переданный
+// снимок мог устареть, пока другой запрос запускал или отменял таймер.
+// Блокировка берётся до вызова Store, но никогда из callback Store.Update.
 func (s *Server) syncTimer(b *model.Board) *model.Board {
-	if b.TimerEndsAt == nil {
-		s.cancelTimer(b.ID)
-		return b
-	}
-	if !time.Now().Before(*b.TimerEndsAt) {
-		if nb := s.fireTimer(b.ID); nb != nil {
-			return nb
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.syncTimerLocked(b.ID)
+	if err != nil {
+		s.log.Error("таймер фазы не синхронизирован", "board", b.ID, "err", err)
+		if !errors.Is(err, model.ErrNotFound) {
+			var endsAt time.Time
+			if b.TimerEndsAt != nil {
+				endsAt = *b.TimerEndsAt
+			}
+			s.retryTimerLocked(b.ID, endsAt)
 		}
 		return b
 	}
-	s.scheduleTimer(b.ID, *b.TimerEndsAt)
-	return b
+	return current
 }
 
-func (s *Server) scheduleTimer(id string, at time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if t, ok := s.timers[id]; ok {
-		t.Stop()
+// syncTimerLocked читает актуальное состояние и при необходимости применяет
+// истечение. Пока удерживается mu, другой запрос может записать доску, но его
+// синхронизация выполнится после этой и снова прочитает актуальные данные.
+func (s *Server) syncTimerLocked(id string) (*model.Board, error) {
+	b, err := s.store.Get(id)
+	if err != nil {
+		return nil, err
 	}
-	s.timers[id] = time.AfterFunc(time.Until(at), func() { s.fireTimer(id) })
+	if b.TimerEndsAt != nil && !time.Now().Before(*b.TimerEndsAt) {
+		expected := *b.TimerEndsAt
+		current, err := s.store.Update(id, func(bd *model.Board) error {
+			// Между Get и Update ведущий мог перенести или снять таймер.
+			if bd.TimerEndsAt == nil || !bd.TimerEndsAt.Equal(expected) || !bd.ExpireTimer(time.Now()) {
+				return errTimerNotDue
+			}
+			return nil
+		})
+		if errors.Is(err, errTimerNotDue) {
+			current, err = s.store.Get(id)
+		} else if err == nil {
+			s.log.Info("таймер истёк, этап переключён", "board", id, "phase", current.Phase)
+			s.hub.Notify(id)
+		}
+		if err != nil {
+			return b, err
+		}
+		b = current
+	}
+	if b.TimerEndsAt == nil {
+		s.cancelTimerLocked(id)
+	} else if scheduled := s.timers[id]; scheduled == nil || !scheduled.endsAt.Equal(*b.TimerEndsAt) {
+		s.scheduleTimerLocked(id, *b.TimerEndsAt, time.Until(*b.TimerEndsAt))
+	}
+	return b, nil
 }
 
-func (s *Server) cancelTimer(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if t, ok := s.timers[id]; ok {
-		t.Stop()
+func (s *Server) scheduleTimerLocked(id string, endsAt time.Time, delay time.Duration) {
+	s.cancelTimerLocked(id)
+	scheduled := &phaseTimer{endsAt: endsAt}
+	s.timers[id] = scheduled
+	scheduled.timer = time.AfterFunc(delay, func() { s.fireTimer(id, scheduled) })
+}
+
+// retryTimerLocked не заменяет действующее поколение сведениями из старого
+// снимка. Повторное чтение нужно и при nil-дедлайне: в хранилище уже мог
+// появиться таймер. Для действующего таймера отдельный callback позволяет
+// восстановить сокращённый срок, не дожидаясь прежнего позднего дедлайна.
+func (s *Server) retryTimerLocked(id string, endsAt time.Time) {
+	select {
+	case <-s.hub.Done():
+		return
+	default:
+	}
+	if scheduled := s.timers[id]; scheduled != nil {
+		if scheduled.retry == nil {
+			scheduled.retry = time.AfterFunc(time.Second, func() { s.fireTimer(id, scheduled) })
+		}
+		return
+	}
+	s.scheduleTimerLocked(id, endsAt, time.Second)
+}
+
+func (s *Server) cancelTimerLocked(id string) {
+	if scheduled, ok := s.timers[id]; ok {
+		scheduled.timer.Stop()
+		if scheduled.retry != nil {
+			scheduled.retry.Stop()
+		}
 		delete(s.timers, id)
 	}
 }
 
-// fireTimer применяет истечение таймера к доске. Если таймер к этому моменту
-// снят или перенесён, Update откатывается и ничего не меняется.
-func (s *Server) fireTimer(id string) *model.Board {
-	s.cancelTimer(id)
-	b, err := s.store.Update(id, func(bd *model.Board) error {
-		if !bd.ExpireTimer(time.Now()) {
-			return errTimerNotDue
-		}
-		return nil
-	})
-	if err != nil {
-		if !errors.Is(err, errTimerNotDue) && !errors.Is(err, model.ErrNotFound) {
-			s.log.Error("таймер фазы не применён", "board", id, "err", err)
-		}
-		return nil
+// fireTimer принимает только действующее поколение. Старый callback после
+// Stop уже мог начать выполняться, поэтому одного Stop недостаточно.
+func (s *Server) fireTimer(id string, scheduled *phaseTimer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.timers[id] != scheduled {
+		return
 	}
-	s.log.Info("таймер истёк, этап переключён", "board", id, "phase", b.Phase)
-	s.hub.Notify(id)
-	return b
+	s.cancelTimerLocked(id)
+	select {
+	case <-s.hub.Done():
+		return
+	default:
+	}
+	b, err := s.syncTimerLocked(id)
+	if err != nil {
+		if !errors.Is(err, model.ErrNotFound) {
+			s.log.Error("таймер фазы не применён", "board", id, "err", err)
+			// Временная ошибка хранилища не должна навсегда потерять таймер.
+			endsAt := scheduled.endsAt
+			if b != nil && b.TimerEndsAt != nil {
+				endsAt = *b.TimerEndsAt
+			}
+			s.retryTimerLocked(id, endsAt)
+		}
+	}
 }
 
 func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +431,7 @@ func (s *Server) handleAddCard(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	s.mutate(w, r, func(b *model.Board, pid string) error {
+	s.mutateOnce(w, r, "cards.create", in, func(b *model.Board, pid string) error {
 		_, err := b.AddCard(in.ColumnID, in.Text, in.Author, pid)
 		return err
 	})
@@ -270,15 +439,20 @@ func (s *Server) handleAddCard(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEditCard(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Text string `json:"text"`
+		Text     string  `json:"text"`
+		Revision *uint64 `json:"revision"`
 	}
 	if err := decode(w, r, &in); err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	if in.Revision == nil {
+		s.writeErr(w, fmt.Errorf("%w: обновите страницу и откройте карточку заново перед сохранением", model.ErrInvalid))
+		return
+	}
 	cardID := r.PathValue("cardId")
 	s.mutate(w, r, func(b *model.Board, pid string) error {
-		return b.EditCard(cardID, in.Text, pid)
+		return b.EditCard(cardID, in.Text, pid, *in.Revision)
 	})
 }
 
@@ -290,9 +464,20 @@ func (s *Server) handleDeleteCard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Voted *bool `json:"voted"`
+	}
+	if err := decode(w, r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if in.Voted == nil {
+		s.writeErr(w, fmt.Errorf("%w: укажите voted: true или false", model.ErrInvalid))
+		return
+	}
 	cardID := r.PathValue("cardId")
 	s.mutate(w, r, func(b *model.Board, pid string) error {
-		_, err := b.ToggleVote(cardID, pid)
+		_, err := b.SetVote(cardID, pid, *in.Voted)
 		return err
 	})
 }
@@ -353,7 +538,7 @@ func (s *Server) handleAddAction(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	s.mutate(w, r, func(b *model.Board, pid string) error {
+	s.mutateOnce(w, r, "actions.create", in, func(b *model.Board, pid string) error {
 		_, err := b.AddAction(in.Text, in.Assignee, pid)
 		return err
 	})
@@ -361,16 +546,21 @@ func (s *Server) handleAddAction(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEditAction(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Text     string `json:"text"`
-		Assignee string `json:"assignee"`
+		Text     string  `json:"text"`
+		Assignee string  `json:"assignee"`
+		Revision *uint64 `json:"revision"`
 	}
 	if err := decode(w, r, &in); err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	if in.Revision == nil {
+		s.writeErr(w, fmt.Errorf("%w: обновите страницу и откройте решение заново перед сохранением", model.ErrInvalid))
+		return
+	}
 	actionID := r.PathValue("actionId")
 	s.mutate(w, r, func(b *model.Board, pid string) error {
-		return b.EditAction(actionID, in.Text, in.Assignee, pid)
+		return b.EditAction(actionID, in.Text, in.Assignee, pid, *in.Revision)
 	})
 }
 
@@ -381,18 +571,27 @@ func (s *Server) handleDeleteAction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleToggleActionDone(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSetActionDone(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Done *bool `json:"done"`
+	}
+	if err := decode(w, r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if in.Done == nil {
+		s.writeErr(w, fmt.Errorf("%w: укажите done: true или false", model.ErrInvalid))
+		return
+	}
 	actionID := r.PathValue("actionId")
 	s.mutate(w, r, func(b *model.Board, pid string) error {
-		_, err := b.ToggleActionDone(actionID, pid)
+		_, err := b.SetActionDone(actionID, *in.Done, pid)
 		return err
 	})
 }
 
-// handleNextBoard создаёт следующее ретро из текущего. Сначала в предыдущей
-// доске резервируется NextID (проверка прав и «следующего ещё нет» идёт под
-// её мьютексом), затем создаётся новая доска; если создать не удалось,
-// NextID снимается.
+// handleNextBoard создаёт следующее ретро и связь с предыдущим атомарно:
+// при сбое хранилища ни новая доска, ни ссылка на неё не сохраняются.
 func (s *Server) handleNextBoard(w http.ResponseWriter, r *http.Request) {
 	pid, err := participant(r)
 	if err != nil {
@@ -407,24 +606,8 @@ func (s *Server) handleNextBoard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prevID := r.PathValue("id")
-	var next *model.Board
-	if _, err := s.store.Update(prevID, func(prev *model.Board) error {
-		b, err := prev.NextBoard(in.Title, pid)
-		if err != nil {
-			return err
-		}
-		prev.NextID = b.ID
-		next = b
-		return nil
-	}); err != nil {
-		s.writeErr(w, err)
-		return
-	}
-	if err := s.store.Create(next); err != nil {
-		_, _ = s.store.Update(prevID, func(prev *model.Board) error {
-			prev.NextID = ""
-			return nil
-		})
+	next, err := s.store.CreateNext(prevID, in.Title, pid)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -489,14 +672,18 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSetTimer(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Minutes int `json:"minutes"`
+		Minutes *int `json:"minutes"`
 	}
 	if err := decode(w, r, &in); err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	if in.Minutes == nil {
+		s.writeErr(w, fmt.Errorf("%w: укажите minutes: число минут, 0 — остановить таймер", model.ErrInvalid))
+		return
+	}
 	s.mutate(w, r, func(b *model.Board, pid string) error {
-		return b.SetTimer(in.Minutes, time.Now(), pid)
+		return b.SetTimer(*in.Minutes, time.Now(), pid)
 	})
 }
 

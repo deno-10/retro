@@ -128,7 +128,7 @@ func TestNextBoardAndHistory(t *testing.T) {
 	_, out = do(t, h, "POST", "/api/boards/"+first+"/actions", alice, map[string]any{"text": "Закрытое"})
 	acts := out["actions"].([]any)
 	closedID := acts[len(acts)-1].(map[string]any)["id"].(string)
-	do(t, h, "POST", "/api/boards/"+first+"/actions/"+closedID+"/done", alice, nil)
+	do(t, h, "POST", "/api/boards/"+first+"/actions/"+closedID+"/done", alice, map[string]any{"done": true})
 
 	if rec, _ := do(t, h, "POST", "/api/boards/"+first+"/next", alice, map[string]any{"title": "Спринт 2"}); rec.Code != http.StatusForbidden {
 		t.Fatalf("следующее ретро не ведущим: %d", rec.Code)
@@ -238,10 +238,10 @@ func TestActionsFlow(t *testing.T) {
 		t.Fatalf("неожиданное решение: %v", action)
 	}
 
-	if rec, _ = do(t, h, "PATCH", "/api/boards/"+id+"/actions/"+actionID, bob, map[string]any{"text": "x"}); rec.Code != http.StatusForbidden {
+	if rec, _ = do(t, h, "PATCH", "/api/boards/"+id+"/actions/"+actionID, bob, map[string]any{"text": "x", "revision": action["revision"]}); rec.Code != http.StatusForbidden {
 		t.Fatalf("правка чужого решения: %d", rec.Code)
 	}
-	rec, out = do(t, h, "POST", "/api/boards/"+id+"/actions/"+actionID+"/done", owner, nil)
+	rec, out = do(t, h, "POST", "/api/boards/"+id+"/actions/"+actionID+"/done", owner, map[string]any{"done": true})
 	if rec.Code != http.StatusOK || out["actions"].([]any)[0].(map[string]any)["done"] != true {
 		t.Fatalf("отметка сделанным ведущим: %d %s", rec.Code, rec.Body)
 	}

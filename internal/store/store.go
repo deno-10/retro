@@ -20,6 +20,10 @@ import (
 // Update применяет fn к доске атомарно: либо вся мутация, либо ничего.
 type Store interface {
 	Create(b *model.Board) error
+	// CreateMany сохраняет все доски либо не сохраняет ни одной.
+	CreateMany(boards []*model.Board) error
+	// CreateNext атомарно создаёт следующее ретро и связывает обе доски.
+	CreateNext(prevID, title, actorID string) (*model.Board, error)
 	Get(id string) (*model.Board, error)
 	Update(id string, fn func(b *model.Board) error) (*model.Board, error)
 	Close() error
@@ -50,21 +54,75 @@ func OpenJSON(path string) (*JSONStore, error) {
 
 // Create сохраняет новую доску.
 func (s *JSONStore) Create(b *model.Board) error {
+	return s.CreateMany([]*model.Board{b})
+}
+
+// CreateMany добавляет доски одним снимком; ошибка не меняет память и файл.
+func (s *JSONStore) CreateMany(boards []*model.Board) error {
+	if len(boards) == 0 {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.boards[b.ID]; exists {
-		return fmt.Errorf("доска %s уже существует", b.ID)
+	added := make(map[string]*model.Board, len(boards))
+	for _, b := range boards {
+		if b == nil {
+			return fmt.Errorf("%w: доска не задана", model.ErrInvalid)
+		}
+		if s.boards[b.ID] != nil || added[b.ID] != nil {
+			return fmt.Errorf("доска %s уже существует", b.ID)
+		}
+		c, err := clone(b)
+		if err != nil {
+			return err
+		}
+		added[b.ID] = c
 	}
-	c, err := clone(b)
-	if err != nil {
-		return err
+	for id, b := range added {
+		s.boards[id] = b
 	}
-	s.boards[b.ID] = c
 	if err := s.persistLocked(); err != nil {
-		delete(s.boards, b.ID)
+		for id := range added {
+			delete(s.boards, id)
+		}
 		return err
 	}
 	return nil
+}
+
+// CreateNext проверяет права и сохраняет обе доски под одной блокировкой.
+func (s *JSONStore) CreateNext(prevID, title, actorID string) (*model.Board, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.boards[prevID]
+	if !ok {
+		return nil, model.ErrNotFound
+	}
+	prev, err := clone(current)
+	if err != nil {
+		return nil, err
+	}
+	next, err := prev.NextBoard(title, actorID)
+	if err != nil {
+		return nil, err
+	}
+	if _, exists := s.boards[next.ID]; exists {
+		return nil, fmt.Errorf("доска %s уже существует", next.ID)
+	}
+	savedNext, err := clone(next)
+	if err != nil {
+		return nil, err
+	}
+	prev.NextID = next.ID
+	prev.Revision = current.Revision + 1
+	prev.UpdatedAt = time.Now()
+	s.boards[prevID], s.boards[next.ID] = prev, savedNext
+	if err := s.persistLocked(); err != nil {
+		s.boards[prevID] = current
+		delete(s.boards, next.ID)
+		return nil, err
+	}
+	return next, nil
 }
 
 // Get возвращает копию доски.
@@ -94,6 +152,7 @@ func (s *JSONStore) Update(id string, fn func(b *model.Board) error) (*model.Boa
 	if err := fn(work); err != nil {
 		return nil, err
 	}
+	work.Revision = current.Revision + 1
 	work.UpdatedAt = time.Now()
 	s.boards[id] = work
 	if err := s.persistLocked(); err != nil {

@@ -67,7 +67,7 @@ func TestVoteLimit(t *testing.T) {
 		}
 		ids = append(ids, c.ID)
 	}
-	if _, err := b.ToggleVote(ids[0], "bob"); err != ErrPhase {
+	if _, err := b.SetVote(ids[0], "bob", true); err != ErrPhase {
 		t.Fatalf("голосование до фазы vote должно давать ErrPhase, получено %v", err)
 	}
 	if err := b.SetVoteLimit(2, "owner-1"); err != nil {
@@ -77,15 +77,15 @@ func TestVoteLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range ids[:2] {
-		if voted, err := b.ToggleVote(id, "bob"); err != nil || !voted {
+		if voted, err := b.SetVote(id, "bob", true); err != nil || !voted {
 			t.Fatalf("голос должен ставиться: voted=%v err=%v", voted, err)
 		}
 	}
-	if _, err := b.ToggleVote(ids[2], "bob"); err != ErrVotes {
+	if _, err := b.SetVote(ids[2], "bob", true); err != ErrVotes {
 		t.Fatalf("третий голос должен упереться в лимит, получено %v", err)
 	}
-	if voted, err := b.ToggleVote(ids[0], "bob"); err != nil || voted {
-		t.Fatalf("повторный клик должен снимать голос: voted=%v err=%v", voted, err)
+	if voted, err := b.SetVote(ids[0], "bob", false); err != nil || voted {
+		t.Fatalf("явное снятие должно убрать голос: voted=%v err=%v", voted, err)
 	}
 	if left := b.View("bob").VotesLeft; left != 1 {
 		t.Fatalf("ожидался 1 оставшийся голос, получено %d", left)
@@ -110,10 +110,10 @@ func TestEditPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := c.ID
-	if err := b.EditCard(id, "новый", "bob"); err != ErrForbidden {
+	if err := b.EditCard(id, "новый", "bob", c.Revision); err != ErrForbidden {
 		t.Fatalf("чужую карточку править нельзя: %v", err)
 	}
-	if err := b.EditCard(id, "новый", "alice"); err != nil {
+	if err := b.EditCard(id, "новый", "alice", c.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.DeleteCard(id, "owner-1"); err != nil {
@@ -141,7 +141,7 @@ func TestDiscussSortsByVotes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, v := range []struct{ card, who string }{{secondID, "bob"}, {secondID, "carol"}, {firstID, "bob"}} {
-		if _, err := b.ToggleVote(v.card, v.who); err != nil {
+		if _, err := b.SetVote(v.card, v.who, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -171,7 +171,7 @@ func TestNextBoard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.ToggleActionDone(closed.ID, "owner-1"); err != nil {
+	if _, err := b.SetActionDone(closed.ID, true, "owner-1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.SetVoteLimit(7, "owner-1"); err != nil {
@@ -265,18 +265,18 @@ func TestGrouping(t *testing.T) {
 	if err := b.SetPhase(PhaseVote, "owner-1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.ToggleVote(ids[2], "bob"); err != nil {
+	if _, err := b.SetVote(ids[2], "bob", true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.ToggleVote(ids[3], "carol"); err != nil {
+	if _, err := b.SetVote(ids[3], "carol", true); err != nil {
 		t.Fatal(err)
 	}
 	v := b.View("bob").Columns[0].Cards
 	if v[0].GroupVotes != 1 || !v[0].GroupVoted || v[2].Votes != 1 {
 		t.Fatalf("голоса группы должны суммироваться: %+v", v)
 	}
-	if voted, err := b.ToggleVote(ids[0], "bob"); err != nil || voted {
-		t.Fatalf("повторный голос за группу через другую карточку должен снимать: voted=%v err=%v", voted, err)
+	if voted, err := b.SetVote(ids[0], "bob", false); err != nil || voted {
+		t.Fatalf("явное снятие голоса через другую карточку группы: voted=%v err=%v", voted, err)
 	}
 	if b.View("bob").Columns[0].Cards[0].GroupVotes != 0 {
 		t.Fatal("голос должен быть снят с группы")
@@ -328,20 +328,20 @@ func TestActions(t *testing.T) {
 	}
 	id := a.ID
 
-	if err := b.EditAction(id, "x", "", "bob"); err != ErrForbidden {
+	if err := b.EditAction(id, "x", "", "bob", a.Revision); err != ErrForbidden {
 		t.Fatalf("чужое решение править нельзя: %v", err)
 	}
-	if _, err := b.ToggleActionDone(id, "bob"); err != ErrForbidden {
+	if _, err := b.SetActionDone(id, true, "bob"); err != ErrForbidden {
 		t.Fatalf("чужое решение отмечать нельзя: %v", err)
 	}
-	if err := b.EditAction(id, "Настроить алерты в проде", "Боб", "alice"); err != nil {
+	if err := b.EditAction(id, "Настроить алерты в проде", "Боб", "alice", a.Revision); err != nil {
 		t.Fatal(err)
 	}
-	if done, err := b.ToggleActionDone(id, "owner-1"); err != nil || !done {
+	if done, err := b.SetActionDone(id, true, "owner-1"); err != nil || !done {
 		t.Fatalf("ведущий может отметить сделанным: done=%v err=%v", done, err)
 	}
-	if done, err := b.ToggleActionDone(id, "alice"); err != nil || done {
-		t.Fatalf("повторная отметка снимает: done=%v err=%v", done, err)
+	if done, err := b.SetActionDone(id, false, "alice"); err != nil || done {
+		t.Fatalf("явное снятие отметки: done=%v err=%v", done, err)
 	}
 
 	v := b.View("alice")
@@ -352,7 +352,7 @@ func TestActions(t *testing.T) {
 		t.Fatal("чужое решение не должно помечаться как своё")
 	}
 
-	if _, err := b.ToggleActionDone(id, "alice"); err != nil {
+	if _, err := b.SetActionDone(id, true, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	if md := b.Markdown(); !containsAll(md, "## Решения", "- [x] Настроить алерты в проде — Боб") {

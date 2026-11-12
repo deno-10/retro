@@ -1,0 +1,14 @@
+{
+  "name": "retro-frontend-tests",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/frontend/*.test.cjs",
+    "test:integration": "node --test tests/integration/*.test.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
