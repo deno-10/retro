@@ -51,8 +51,10 @@ before(async () => {
     headless: true,
     // Playwright обычно отключает BFCache; здесь проверяем настоящий Back/Forward.
     ignoreDefaultArgs: ['--disable-back-forward-cache'],
+    // В Headless Shell этот сценарий не попадает в BFCache. Полноценный
+    // Chromium использует тот же жизненный цикл страницы, что обычный браузер.
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
-      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } : {}),
+      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } : { channel: 'chromium' }),
   });
 }, { timeout: 180000 });
 

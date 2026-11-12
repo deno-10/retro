@@ -63,6 +63,8 @@ Browser regressions live in `tests/frontend/` and use Node’s test runner with 
 
 Live integration tests in `tests/integration/` build and start the Go binary on a local port with a temporary SQLite database. Run `npm run test:integration` after changes to the API/client contract. They check concurrent editing, HTTP updates without SSE, lost responses with safe retries, and action completion against the actual backend. Back/Forward regressions enable Chromium BFCache and assert both `pageshow.persisted` and the original document identity; synthetic events alone do not cover navigation. Tests stop their server and remove temporary data.
 
+Live integration uses the full Chromium channel (`channel: 'chromium'`) in headless mode, or an explicit `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`. Headless Shell does not restore the native SSE scenario from BFCache. Install full Chromium (`playwright install chromium`, not `--only-shell`) and keep the strict document identity/persisted assertions.
+
 Reload and timeout regressions check both draft persistence and server outcomes. Browser clocks may advance request deadlines, but integration requests still use the real Go handler and SQLite. Never use the application's regular `data/` for these tests.
 
 ### Revisions and retries
