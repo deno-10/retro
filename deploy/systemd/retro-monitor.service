@@ -1,0 +1,9 @@
+[Unit]
+Description=Retro: доступность, ошибки, диск и возраст бэкапа
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/retro/deploy/ops.py --config /etc/retro/ops.json check
+TimeoutStartSec=50s
+UMask=0077

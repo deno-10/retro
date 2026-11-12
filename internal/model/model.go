@@ -54,6 +54,9 @@ const (
 	DefaultVoteLimit = 5
 	MaxVoteLimit     = 20
 	MaxTimerMinutes  = 120
+	MaxCards         = 500
+	MaxActions       = 200
+	MaxReceipts      = 5000
 )
 
 // Ошибки предметной области. HTTP-слой превращает их в коды ответа.
@@ -64,6 +67,7 @@ var (
 	ErrVotes     = errors.New("голоса закончились")
 	ErrInvalid   = errors.New("некорректные данные")
 	ErrConflict  = errors.New("запись уже изменена другим участником")
+	ErrCapacity  = errors.New("достигнут предел размера")
 )
 
 // Board — доска одного ретро.
@@ -263,6 +267,13 @@ func cleanText(text string) (string, error) {
 func (b *Board) AddCard(columnID, text, author, authorID string) (*Card, error) {
 	if b.Phase != PhaseWrite && b.Phase != PhaseReveal {
 		return nil, ErrPhase
+	}
+	count := 0
+	for _, col := range b.Columns {
+		count += len(col.Cards)
+	}
+	if count >= MaxCards {
+		return nil, fmt.Errorf("%w: не более %d карточек на доске", ErrCapacity, MaxCards)
 	}
 	text, err := cleanText(text)
 	if err != nil {
@@ -599,6 +610,9 @@ func (b *Board) canEditAction(a *Action, actorID string) error {
 func (b *Board) AddAction(text, assignee, authorID string) (*Action, error) {
 	if b.Phase == PhaseWrite {
 		return nil, ErrPhase
+	}
+	if len(b.Actions) >= MaxActions {
+		return nil, fmt.Errorf("%w: не более %d решений на доске", ErrCapacity, MaxActions)
 	}
 	text, err := cleanText(text)
 	if err != nil {

@@ -9,7 +9,7 @@ import (
 	"context"
 	"embed"
 	"errors"
-	"flag"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -29,54 +29,67 @@ import (
 var webFS embed.FS
 
 func main() {
-	addr := flag.String("addr", ":8080", "адрес, на котором слушать")
-	dataFile := flag.String("data", "data/retro.db", "файл с данными досок: SQLite, либо .json для прежнего формата")
-	flag.Parse()
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-
-	st, err := openStore(*dataFile, logger)
-	if err != nil {
-		logger.Error("не удалось открыть хранилище", "err", err)
-		os.Exit(1)
-	}
-	defer st.Close()
-
-	static, err := fs.Sub(webFS, "web")
-	if err != nil {
-		logger.Error("статика не найдена в бинарнике", "err", err)
-		os.Exit(1)
-	}
-
-	h := hub.New()
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           server.New(st, h, static, logger),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := runCLI(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
-	go func() {
-		logger.Info("retro запущен", "addr", *addr, "data", *dataFile)
-		for _, u := range shareURLs(*addr, lanIPs()) {
-			logger.Info("ссылка для команды", "url", u)
-		}
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("сервер остановлен с ошибкой", "err", err)
-			stop()
-		}
-	}()
+func serve(ctx context.Context, addr, dataFile string, options server.Options, logger *slog.Logger) error {
+	// Сначала занимаем порт: ошибка запуска возвращается вызывающему коду,
+	// до открытия/миграции данных и до сообщения об успешном запуске.
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть порт: %w", err)
+	}
+	defer listener.Close()
+	st, err := openStore(dataFile, logger)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть хранилище: %w", err)
+	}
+	defer st.Close()
+	static, err := fs.Sub(webFS, "web")
+	if err != nil {
+		return err
+	}
+	h := hub.New()
+	defer h.Close()
+	srv := &http.Server{
+		Handler:           server.New(st, h, static, logger, options),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		// Общий WriteTimeout оборвал бы долгоживущие SSE. HTTP-слой
+		// ставит отдельный дедлайн на каждый ответ/запись в поток.
+	}
+	result := make(chan error, 1)
+	logger.Info("retro запущен", "addr", listener.Addr().String(), "data", dataFile)
+	for _, u := range shareURLs(listener.Addr().String(), lanIPs()) {
+		logger.Info("ссылка для команды", "url", u)
+	}
+	go func() { result <- srv.Serve(listener) }()
 
-	<-ctx.Done()
+	select {
+	case err := <-result:
+		srv.Close()
+		if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("сервер остановлен с ошибкой: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+	}
 	h.Close() // закрыть SSE-потоки, иначе Shutdown будет ждать их до таймаута
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("остановка с ошибкой", "err", err)
+		srv.Close()
+		return fmt.Errorf("остановка с ошибкой: %w", err)
 	}
 	logger.Info("retro остановлен")
+	return nil
 }
 
 // shareURLs — адреса, по которым команда откроет доску. Если сервер слушает
