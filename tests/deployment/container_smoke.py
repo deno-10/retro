@@ -15,7 +15,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def run(*args, **kwargs):
-    return subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs).stdout
+    try:
+        return subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs).stdout
+    except subprocess.CalledProcessError as error:
+        # Ошибки запуска Docker ещё не попадают в логи контейнеров.
+        print(error.stdout.decode(errors="replace"), flush=True)
+        print(error.stderr.decode(errors="replace"), flush=True)
+        raise
 
 
 def main():
@@ -37,7 +43,7 @@ def main():
         def request(path, method="GET", data=None):
             req = urllib.request.Request("https://localhost" + path, method=method,
                 data=json.dumps(data).encode() if data is not None else None,
-                headers={"Authorization": "Basic dGVhbTp0ZXN0LW9ubHk=", "X-Participant": "owner-00000001", "Content-Type": "application/json"})
+                headers={"Authorization": "Basic dGVhbTp0ZXN0LW9ubHk=", "X-Participant": "owner-00000001", "Content-Type": "application/json", "Origin": "https://localhost"})
             with urllib.request.urlopen(req, context=context, timeout=3) as response:
                 return json.load(response)
 
