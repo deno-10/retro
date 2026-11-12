@@ -1,0 +1,80 @@
+name: retro
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  retro:
+    image: ${RETRO_IMAGE:?Укажите версионированный RETRO_IMAGE в .env}
+    build: .
+    command: ["-addr", ":8080", "-data", "/app/data/retro.db", "-log-json", "-trusted-proxy", "172.30.91.2/32"]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 15s
+    tmpfs: ["/tmp:size=512m,mode=1777"]
+    volumes: ["retro_data:/app/data"]
+    networks: [backend]
+    logging: *logging
+    # Порт 8080 не публикуется: все внешние запросы проходят через вход Caddy.
+    healthcheck:
+      test: [CMD, /app/retro, healthcheck]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    environment:
+      RETRO_DOMAIN: ${RETRO_DOMAIN:?Укажите домен в .env}
+      ACME_EMAIL: ${ACME_EMAIL:?Укажите почту для сертификатов в .env}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    secrets: [retro_users]
+    networks:
+      edge:
+      backend:
+        ipv4_address: 172.30.91.2
+    depends_on:
+      retro:
+        condition: service_healthy
+    logging: *logging
+
+secrets:
+  retro_users:
+    file: ./deploy/secrets/users.caddy
+
+volumes:
+  retro_data:
+    name: ${RETRO_DATA_VOLUME:-retro_data}
+  caddy_data:
+  caddy_config:
+
+networks:
+  edge:
+  backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.91.0/24

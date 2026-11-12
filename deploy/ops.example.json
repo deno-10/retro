@@ -1,0 +1,14 @@
+{
+  "project_dir": "/opt/retro",
+  "state_dir": "/var/lib/retro-ops",
+  "public_url": "https://retro.example.org/readyz",
+  "backup_host": "retro-production",
+  "restic_repository_file": "/etc/retro/restic-repository",
+  "restic_password_file": "/etc/retro/restic-password",
+  "restic_environment_file": "/etc/retro/restic-environment.json",
+  "webhook_url_file": "/etc/retro/alert-webhook",
+  "max_backup_age_hours": 27,
+  "min_disk_free_gib": 2,
+  "min_disk_free_percent": 15,
+  "alert_after_failures": 3
+}

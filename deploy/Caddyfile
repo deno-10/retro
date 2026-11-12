@@ -1,0 +1,45 @@
+{
+	email {$ACME_EMAIL}
+	admin off
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 20s
+			idle 2m
+		}
+		max_header_size 16KB
+	}
+}
+
+{$RETRO_DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+	# Публичная проверка не содержит текстов, ID досок или параметров БД.
+	handle /readyz {
+		reverse_proxy retro:8080
+	}
+	@internal path /healthz /metrics
+	handle @internal {
+		respond 404
+	}
+	handle {
+		basic_auth {
+			import /run/secrets/retro_users
+		}
+		reverse_proxy retro:8080 {
+			# Перезаписать, а не доверять значениям внешнего клиента.
+			header_up X-Real-IP {remote_host}
+			header_up -Authorization
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 15s
+			}
+			# text/event-stream Caddy передаёт сразу, без буферизации.
+		}
+	}
+}

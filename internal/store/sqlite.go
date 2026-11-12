@@ -75,6 +75,13 @@ func (s *SQLiteStore) CreateMany(boards []*model.Board) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // после Commit откат — no-op
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM boards").Scan(&count); err != nil {
+		return err
+	}
+	if err := checkBoardCount(count, len(boards)); err != nil {
+		return err
+	}
 	for _, b := range boards {
 		if err := insertBoard(tx, b); err != nil {
 			return err
@@ -86,6 +93,9 @@ func (s *SQLiteStore) CreateMany(boards []*model.Board) error {
 func insertBoard(tx *sql.Tx, b *model.Board) error {
 	if b == nil {
 		return fmt.Errorf("%w: доска не задана", model.ErrInvalid)
+	}
+	if err := checkBoardSize(b); err != nil {
+		return err
 	}
 	data, err := json.Marshal(b)
 	if err != nil {
@@ -121,6 +131,13 @@ func (s *SQLiteStore) CreateNext(prevID, title, actorID string) (*model.Board, e
 	}
 	next, err := prev.NextBoard(title, actorID)
 	if err != nil {
+		return nil, err
+	}
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM boards").Scan(&count); err != nil {
+		return nil, err
+	}
+	if err := checkBoardCount(count, 1); err != nil {
 		return nil, err
 	}
 	prev.NextID = next.ID
@@ -194,6 +211,9 @@ func readBoard(tx *sql.Tx, id string) (*model.Board, error) {
 }
 
 func updateBoard(tx *sql.Tx, id string, b *model.Board) error {
+	if err := checkBoardSize(b); err != nil {
+		return err
+	}
 	b.UpdatedAt = time.Now()
 	out, err := json.Marshal(b)
 	if err != nil {

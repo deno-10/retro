@@ -6,3 +6,10 @@ data
 retro
 .DS_Store
 *.tmp
+.env
+deploy/secrets
+*.db
+*.db-wal
+*.db-shm
+**/__pycache__
+*.py[cod]

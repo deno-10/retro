@@ -1,0 +1,12 @@
+[Unit]
+Description=Retro: снимок SQLite, удалённый бэкап и проверка восстановления
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/retro/deploy/ops.py --config /etc/retro/ops.json backup
+TimeoutStartSec=30min
+UMask=0077
+Nice=10

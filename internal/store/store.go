@@ -64,6 +64,9 @@ func (s *JSONStore) CreateMany(boards []*model.Board) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := checkBoardCount(len(s.boards), len(boards)); err != nil {
+		return err
+	}
 	added := make(map[string]*model.Board, len(boards))
 	for _, b := range boards {
 		if b == nil {
@@ -71,6 +74,9 @@ func (s *JSONStore) CreateMany(boards []*model.Board) error {
 		}
 		if s.boards[b.ID] != nil || added[b.ID] != nil {
 			return fmt.Errorf("доска %s уже существует", b.ID)
+		}
+		if err := checkBoardSize(b); err != nil {
+			return err
 		}
 		c, err := clone(b)
 		if err != nil {
@@ -104,6 +110,12 @@ func (s *JSONStore) CreateNext(prevID, title, actorID string) (*model.Board, err
 	}
 	next, err := prev.NextBoard(title, actorID)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkBoardCount(len(s.boards), 1); err != nil {
+		return nil, err
+	}
+	if err := checkBoardSize(next); err != nil {
 		return nil, err
 	}
 	if _, exists := s.boards[next.ID]; exists {
@@ -154,6 +166,9 @@ func (s *JSONStore) Update(id string, fn func(b *model.Board) error) (*model.Boa
 	}
 	work.Revision = current.Revision + 1
 	work.UpdatedAt = time.Now()
+	if err := checkBoardSize(work); err != nil {
+		return nil, err
+	}
 	s.boards[id] = work
 	if err := s.persistLocked(); err != nil {
 		s.boards[id] = current

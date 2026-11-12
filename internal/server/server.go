@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,10 +21,13 @@ import (
 
 // Server держит зависимости обработчиков.
 type Server struct {
-	store store.Store
-	hub   *hub.Hub
-	log   *slog.Logger
-	index []byte
+	store   store.Store
+	hub     *hub.Hub
+	log     *slog.Logger
+	index   []byte
+	options Options
+	traffic *trafficGuard
+	stats   *metrics
 
 	// timers — запланированные срабатывания таймеров фаз по id доски.
 	// Планировщик живёт в памяти процесса; после рестарта таймеры
@@ -50,14 +52,23 @@ var errTimerNotDue = errors.New("таймер ещё не истёк")
 var errMutationReplayed = errors.New("операция уже применена")
 
 // New собирает маршрутизатор. static — содержимое каталога web/.
-func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handler {
+func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...Options) http.Handler {
 	index, err := fs.ReadFile(static, "index.html")
 	if err != nil {
 		panic("web/index.html не найден: " + err.Error())
 	}
 	s := &Server{store: st, hub: h, log: log, index: index, timers: map[string]*phaseTimer{}}
+	s.options = DefaultOptions()
+	if len(options) > 0 {
+		s.options = options[0]
+	}
+	s.traffic = newTrafficGuard(s.options)
+	s.stats = &metrics{started: time.Now()}
 
 	m := http.NewServeMux()
+	m.HandleFunc("GET /healthz", s.handleHealth)
+	m.HandleFunc("GET /readyz", s.handleReady)
+	m.HandleFunc("GET /metrics", s.handleMetrics)
 	m.HandleFunc("GET /api/templates", s.handleTemplates)
 	m.HandleFunc("POST /api/boards", s.handleCreateBoard)
 	m.HandleFunc("GET /api/boards/{id}", s.handleGetBoard)
@@ -83,7 +94,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger) http.Handle
 	m.HandleFunc("GET /b/{id}", s.handleIndex)
 	m.HandleFunc("GET /{$}", s.handleIndex)
 
-	return s.withLogging(m)
+	return s.withLogging(s.protect(m))
 }
 
 // participant — идентификатор участника. Браузер генерирует его один раз
@@ -138,7 +149,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case errors.Is(err, model.ErrForbidden):
 		status = http.StatusForbidden
-	case errors.Is(err, model.ErrPhase), errors.Is(err, model.ErrVotes), errors.Is(err, model.ErrConflict):
+	case errors.Is(err, model.ErrPhase), errors.Is(err, model.ErrVotes), errors.Is(err, model.ErrConflict), errors.Is(err, model.ErrCapacity):
 		status = http.StatusConflict
 	case errors.Is(err, model.ErrInvalid):
 		status = http.StatusBadRequest
@@ -228,6 +239,9 @@ func (s *Server) mutateOnce(w http.ResponseWriter, r *http.Request, operation st
 				return fmt.Errorf("%w: Idempotency-Key уже использован для другого запроса", model.ErrConflict)
 			}
 			return errMutationReplayed
+		}
+		if len(b.Receipts) >= model.MaxReceipts {
+			return fmt.Errorf("%w: слишком много операций создания; начните следующее ретро", model.ErrCapacity)
 		}
 		if err := fn(b, pid); err != nil {
 			return err
@@ -697,11 +711,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
+	release, ok := s.traffic.acquireStream(s.traffic.clientIP(r), id)
+	if !ok {
+		rejectBusy(w)
+		return
+	}
+	defer release()
 	if _, err := s.store.Get(id); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	flusher, ok := w.(http.Flusher)
+	_, ok = w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
@@ -710,8 +730,22 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no") // nginx: не буферизовать поток
+	controller := http.NewResponseController(w)
+	writeEvent := func(data string) bool {
+		_ = controller.SetWriteDeadline(time.Now().Add(s.options.WriteTimeout))
+		if _, err := io.WriteString(w, data); err != nil {
+			return false
+		}
+		if err := controller.Flush(); err != nil {
+			return false
+		}
+		_ = controller.SetWriteDeadline(time.Time{})
+		return true
+	}
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	if !writeEvent(": connected\n\n") {
+		return
+	}
 
 	signals, unsubscribe := s.hub.Subscribe(id)
 	defer func() {
@@ -734,11 +768,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return false
 		}
-		if _, err := fmt.Fprintf(w, "event: board\ndata: %s\n\n", data); err != nil {
-			return false
-		}
-		flusher.Flush()
-		return true
+		return writeEvent(fmt.Sprintf("event: board\ndata: %s\n\n", data))
 	}
 
 	heartbeat := time.NewTicker(25 * time.Second)
@@ -755,10 +785,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		case <-heartbeat.C:
 			// Комментарий держит соединение живым через прокси и балансировщики.
-			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+			if !writeEvent(": ping\n\n") {
 				return
 			}
-			flusher.Flush()
 		}
 	}
 }
@@ -782,17 +811,4 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(s.index)
-}
-
-// withLogging пишет одну строку на запрос. ResponseWriter не оборачивается:
-// обёртка спрятала бы http.Flusher, без которого SSE не работает.
-func (s *Server) withLogging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		if strings.HasPrefix(r.URL.Path, "/static/") {
-			return
-		}
-		s.log.Info("http", "method", r.Method, "path", r.URL.Path, "dur", time.Since(start).Round(time.Millisecond))
-	})
 }
