@@ -63,18 +63,20 @@ var (
 	ErrPhase     = errors.New("в текущей фазе это действие недоступно")
 	ErrVotes     = errors.New("голоса закончились")
 	ErrInvalid   = errors.New("некорректные данные")
+	ErrConflict  = errors.New("запись уже изменена другим участником")
 )
 
 // Board — доска одного ретро.
 type Board struct {
 	ID        string `json:"id"`
+	Revision  uint64 `json:"revision"`
 	Title     string `json:"title"`
 	Template  string `json:"template"`
 	OwnerID   string `json:"ownerId"` // ведущий: создатель доски
 	Phase     Phase  `json:"phase"`
 	VoteLimit int    `json:"voteLimit"` // голосов на участника
 	// TimerEndsAt — конец таймера текущей фазы; nil — таймер не запущен.
-	// Таймер только информирует: фазу по его истечении переключает ведущий.
+	// По истечении сервер переключает фазу через ExpireTimer.
 	TimerEndsAt *time.Time `json:"timerEndsAt,omitempty"`
 	Columns     []Column   `json:"columns"`
 	Actions     []Action   `json:"actions"` // решения ретро
@@ -84,12 +86,21 @@ type Board struct {
 	NextID    string    `json:"nextId,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// Receipts позволяют распознавать повторную отправку уже применённой команды.
+	// Это внутренние данные: в BoardView они не включаются.
+	Receipts map[string]MutationReceipt `json:"receipts,omitempty"`
+}
+
+type MutationReceipt struct {
+	Operation   string `json:"operation"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 // Action — решение ретро (action item): что сделать и кто отвечает.
 // Появляются после фазы записи, когда карточки уже обсуждаются.
 type Action struct {
 	ID       string `json:"id"`
+	Revision uint64 `json:"revision"`
 	Text     string `json:"text"`
 	Assignee string `json:"assignee"` // ответственный; пустая строка — не назначен
 	AuthorID string `json:"authorId"` // кто записал решение
@@ -109,6 +120,7 @@ type Column struct {
 // Card — карточка.
 type Card struct {
 	ID        string    `json:"id"`
+	Revision  uint64    `json:"revision"`
 	Text      string    `json:"text"`
 	Author    string    `json:"author"`            // подпись; пустая — анонимно
 	AuthorID  string    `json:"authorId"`          // идентификатор участника
@@ -173,6 +185,7 @@ func NewBoard(title, templateID, ownerID string) (*Board, error) {
 	now := time.Now()
 	b := &Board{
 		ID:        NewID(),
+		Revision:  1,
 		Title:     title,
 		Template:  t.ID,
 		OwnerID:   ownerID,
@@ -189,8 +202,8 @@ func NewBoard(title, templateID, ownerID string) (*Board, error) {
 
 // NextBoard создаёт следующее ретро той же команды: тот же шаблон и ведущий,
 // ссылка на предыдущее, незакрытые решения переносятся с пометкой откуда.
-// Только ведущий, и только если следующего ещё нет. Связь prev.NextID
-// выставляет вызывающий код после успешного сохранения новой доски.
+// Только ведущий, и только если следующего ещё нет. Хранилище атомарно
+// сохраняет новую доску и связь prev.NextID.
 func (prev *Board) NextBoard(title, actorID string) (*Board, error) {
 	if actorID != prev.OwnerID {
 		return nil, ErrForbidden
@@ -213,6 +226,7 @@ func (prev *Board) NextBoard(title, actorID string) (*Board, error) {
 		}
 		b.Actions = append(b.Actions, Action{
 			ID:          NewID(),
+			Revision:    1,
 			Text:        a.Text,
 			Assignee:    a.Assignee,
 			AuthorID:    a.AuthorID,
@@ -262,6 +276,7 @@ func (b *Board) AddCard(columnID, text, author, authorID string) (*Card, error) 
 		if b.Columns[i].ID == columnID {
 			c := Card{
 				ID:        NewID(),
+				Revision:  1,
 				Text:      text,
 				Author:    author,
 				AuthorID:  authorID,
@@ -291,7 +306,7 @@ func (b *Board) canEdit(c *Card, actorID string) error {
 }
 
 // EditCard меняет текст карточки.
-func (b *Board) EditCard(cardID, text, actorID string) error {
+func (b *Board) EditCard(cardID, text, actorID string, expectedRevision uint64) error {
 	_, c := b.findCard(cardID)
 	if c == nil {
 		return fmt.Errorf("%w: карточка не найдена", ErrNotFound)
@@ -299,11 +314,15 @@ func (b *Board) EditCard(cardID, text, actorID string) error {
 	if err := b.canEdit(c, actorID); err != nil {
 		return err
 	}
+	if c.Revision != expectedRevision {
+		return ErrConflict
+	}
 	text, err := cleanText(text)
 	if err != nil {
 		return err
 	}
 	c.Text = text
+	c.Revision++
 	return nil
 }
 
@@ -417,9 +436,9 @@ func (b *Board) VotesUsed(participantID string) int {
 	return n
 }
 
-// ToggleVote ставит голос на карточку или снимает его.
-// Возвращает true, если после вызова голос стоит.
-func (b *Board) ToggleVote(cardID, participantID string) (bool, error) {
+// SetVote устанавливает желаемое состояние голоса на карточке или её группе.
+// Повтор команды не меняет состояние и не расходует дополнительные голоса.
+func (b *Board) SetVote(cardID, participantID string, voted bool) (bool, error) {
 	if b.Phase != PhaseVote {
 		return false, ErrPhase
 	}
@@ -427,8 +446,7 @@ func (b *Board) ToggleVote(cardID, participantID string) (bool, error) {
 	if c == nil {
 		return false, fmt.Errorf("%w: карточка не найдена", ErrNotFound)
 	}
-	// За группу голосуют как за одну карточку: если голос участника уже
-	// стоит на любой карточке группы, повторный клик его снимает.
+	// За группу голосуют как за одну карточку независимо от выбранной карточки группы.
 	members := []*Card{c}
 	if c.GroupID != "" {
 		members = members[:0]
@@ -438,11 +456,24 @@ func (b *Board) ToggleVote(cardID, participantID string) (bool, error) {
 			}
 		}
 	}
+	if !voted {
+		for _, m := range members {
+			kept := m.Votes[:0]
+			for _, v := range m.Votes {
+				if v != participantID {
+					kept = append(kept, v)
+				}
+			}
+			// После объединения карточек у участника могло остаться несколько
+			// голосов в группе. Явное снятие удаляет их все за одну команду.
+			m.Votes = kept
+		}
+		return false, nil
+	}
 	for _, m := range members {
-		for i, v := range m.Votes {
+		for _, v := range m.Votes {
 			if v == participantID {
-				m.Votes = append(m.Votes[:i], m.Votes[i+1:]...)
-				return false, nil
+				return true, nil
 			}
 		}
 	}
@@ -579,6 +610,7 @@ func (b *Board) AddAction(text, assignee, authorID string) (*Action, error) {
 	}
 	b.Actions = append(b.Actions, Action{
 		ID:        NewID(),
+		Revision:  1,
 		Text:      text,
 		Assignee:  assignee,
 		AuthorID:  authorID,
@@ -588,13 +620,16 @@ func (b *Board) AddAction(text, assignee, authorID string) (*Action, error) {
 }
 
 // EditAction меняет текст и ответственного решения.
-func (b *Board) EditAction(actionID, text, assignee, actorID string) error {
+func (b *Board) EditAction(actionID, text, assignee, actorID string, expectedRevision uint64) error {
 	a := b.findAction(actionID)
 	if a == nil {
 		return fmt.Errorf("%w: решение не найдено", ErrNotFound)
 	}
 	if err := b.canEditAction(a, actorID); err != nil {
 		return err
+	}
+	if a.Revision != expectedRevision {
+		return ErrConflict
 	}
 	text, err := cleanText(text)
 	if err != nil {
@@ -605,11 +640,12 @@ func (b *Board) EditAction(actionID, text, assignee, actorID string) error {
 		return err
 	}
 	a.Text, a.Assignee = text, assignee
+	a.Revision++
 	return nil
 }
 
-// ToggleActionDone переключает отметку «сделано». Возвращает новое состояние.
-func (b *Board) ToggleActionDone(actionID, actorID string) (bool, error) {
+// SetActionDone устанавливает отметку «сделано». Повтор той же команды безопасен.
+func (b *Board) SetActionDone(actionID string, done bool, actorID string) (bool, error) {
 	a := b.findAction(actionID)
 	if a == nil {
 		return false, fmt.Errorf("%w: решение не найдено", ErrNotFound)
@@ -617,7 +653,10 @@ func (b *Board) ToggleActionDone(actionID, actorID string) (bool, error) {
 	if err := b.canEditAction(a, actorID); err != nil {
 		return false, err
 	}
-	a.Done = !a.Done
+	if a.Done != done {
+		a.Done = done
+		a.Revision++
+	}
 	return a.Done, nil
 }
 
@@ -688,6 +727,7 @@ func (b *Board) SetVoteLimit(n int, actorID string) error {
 // записи скрыты, голоса видны только с фазы голосования.
 type BoardView struct {
 	ID          string       `json:"id"`
+	Revision    uint64       `json:"revision"`
 	Title       string       `json:"title"`
 	Phase       Phase        `json:"phase"`
 	VoteLimit   int          `json:"voteLimit"`
@@ -710,13 +750,14 @@ type ColumnView struct {
 
 // CardView — карточка в представлении участника.
 type CardView struct {
-	ID     string `json:"id"`
-	Text   string `json:"text"`
-	Author string `json:"author"`
-	Mine   bool   `json:"mine"`
-	Hidden bool   `json:"hidden"`
-	Votes  int    `json:"votes"`
-	Voted  bool   `json:"voted"`
+	ID       string `json:"id"`
+	Revision uint64 `json:"revision"`
+	Text     string `json:"text"`
+	Author   string `json:"author"`
+	Mine     bool   `json:"mine"`
+	Hidden   bool   `json:"hidden"`
+	Votes    int    `json:"votes"`
+	Voted    bool   `json:"voted"`
 	// Группа: карточки с одним groupId идут в списке подряд. GroupVotes и
 	// GroupVoted — по группе целиком, за неё голосуют как за одну карточку.
 	GroupID    string `json:"groupId,omitempty"`
@@ -727,6 +768,7 @@ type CardView struct {
 // ActionView — решение в представлении участника.
 type ActionView struct {
 	ID       string `json:"id"`
+	Revision uint64 `json:"revision"`
 	Text     string `json:"text"`
 	Assignee string `json:"assignee"`
 	Done     bool   `json:"done"`
@@ -739,6 +781,7 @@ func (b *Board) View(viewer string) BoardView {
 	showVotes := b.Phase == PhaseVote || b.Phase == PhaseDiscuss
 	v := BoardView{
 		ID:          b.ID,
+		Revision:    b.Revision,
 		Title:       b.Title,
 		Phase:       b.Phase,
 		VoteLimit:   b.VoteLimit,
@@ -756,7 +799,7 @@ func (b *Board) View(viewer string) BoardView {
 	for _, col := range b.Columns {
 		cv := ColumnView{ID: col.ID, Title: col.Title, Cards: make([]CardView, 0, len(col.Cards))}
 		for _, c := range arrange(col, b.Phase == PhaseDiscuss) {
-			card := CardView{ID: c.ID, Mine: c.AuthorID == viewer, GroupID: c.GroupID}
+			card := CardView{ID: c.ID, Revision: c.Revision, Mine: c.AuthorID == viewer, GroupID: c.GroupID}
 			if b.Phase == PhaseWrite && !card.Mine {
 				card.Hidden = true
 			} else {
@@ -783,7 +826,7 @@ func (b *Board) View(viewer string) BoardView {
 	v.Actions = make([]ActionView, 0, len(b.Actions))
 	for _, a := range b.Actions {
 		v.Actions = append(v.Actions, ActionView{
-			ID: a.ID, Text: a.Text, Assignee: a.Assignee, Done: a.Done,
+			ID: a.ID, Revision: a.Revision, Text: a.Text, Assignee: a.Assignee, Done: a.Done,
 			Mine: a.AuthorID == viewer, Carried: a.CarriedFrom != "",
 		})
 	}

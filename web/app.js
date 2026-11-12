@@ -23,14 +23,34 @@ function randomId() {
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
-const participant = (() => {
-  let id = stored(PID_KEY, '');
-  if (!/^[a-f0-9]{32}$/.test(id)) {
-    id = randomId();
-    store(PID_KEY, id);
-  }
-  return id;
+const identity = (() => {
+  const valid = id => typeof id === 'string' && /^[a-f0-9]{32}$/.test(id);
+  const read = storage => {
+    try { return { value: window[storage].getItem(PID_KEY), readable: true }; }
+    catch { return { value: null, readable: false }; }
+  };
+  const save = (storage, id) => {
+    try {
+      window[storage].setItem(PID_KEY, id);
+      return read(storage).value === id;
+    } catch { return false; }
+  };
+  const localRead = read('localStorage');
+  const sessionRead = read('sessionStorage');
+  const local = localRead.value;
+  const session = sessionRead.value;
+  // Привязка вкладки не меняется, даже если localStorage снова стал
+  // доступен или другая вкладка записала туда другого участника.
+  const id = valid(session) ? session : valid(local) ? local : randomId();
+  // Ошибка чтения не означает пустое хранилище: не затираем неизвестный
+  // существующий идентификатор, если запись при этом ещё разрешена.
+  const durable = local === id || (localRead.readable && !valid(local) && save('localStorage', id));
+  const inSession = session === id || (sessionRead.readable && save('sessionStorage', id));
+  return { id, warning: durable ? '' : inSession
+    ? 'Идентификатор участника сохранён только в этой вкладке. Не закрывайте её: после закрытия доступ к вашим доскам может потеряться.'
+    : 'Браузер не сохраняет идентификатор участника. После обновления или закрытия страницы доступ к вашим доскам и черновикам может потеряться.' };
 })();
+const participant = identity.id;
 
 function authorName() {
   return stored(ANON_KEY, '0') === '1' ? '' : stored(NAME_KEY, '');
@@ -74,28 +94,55 @@ function h(tag, attrs = {}, ...children) {
   return el;
 }
 
-async function api(method, path, body) {
-  let res;
+async function api(method, path, body, options = {}) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let rejectAbort;
+  const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+  const onAbort = () => rejectAbort(new DOMException('Запрос отменён', 'AbortError'));
+  controller.signal.addEventListener('abort', onAbort, { once: true });
+  const forwardAbort = () => controller.abort();
+  options.signal?.addEventListener('abort', forwardAbort, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
   try {
-    res = await fetch(path, {
-      method,
-      headers: { 'Content-Type': 'application/json', 'X-Participant': participant },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  } catch {
-    throw new Error('Сервер недоступен. Проверьте соединение.');
+    const request = (async () => {
+      const res = await fetch(path, {
+        method, cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json', 'X-Participant': participant,
+          ...(options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      });
+      let data;
+      try { data = await res.json(); }
+      catch (err) { if (res.ok || controller.signal.aborted) throw err; }
+      if (!res.ok) {
+        const err = new Error(data?.error || `Ошибка ${res.status}`);
+        err.status = res.status;
+        err.unknownOutcome = method !== 'GET' && res.status >= 500;
+        throw err;
+      }
+      return data;
+    })();
+    // Срок ожидания охватывает и чтение тела: заголовки могут прийти,
+    // а JSON — зависнуть. Отмена также передаётся самому fetch.
+    return await Promise.race([request, aborted]);
+  } catch (err) {
+    if (err.status) throw err;
+    const failure = new Error(timedOut
+      ? 'Сервер не ответил за 15 секунд. Результат запроса не подтверждён.'
+      : 'Не удалось получить ответ сервера. Проверьте соединение.');
+    failure.unknownOutcome = method !== 'GET';
+    failure.timeout = timedOut;
+    throw failure;
+  } finally {
+    clearTimeout(timeout);
+    controller.signal.removeEventListener('abort', onAbort);
+    options.signal?.removeEventListener('abort', forwardAbort);
   }
-  if (!res.ok) {
-    let message = `Ошибка ${res.status}`;
-    try {
-      const data = await res.json();
-      if (data.error) message = data.error;
-    } catch { /* тело не JSON */ }
-    const err = new Error(message);
-    err.status = res.status;
-    throw err;
-  }
-  return res.json();
 }
 
 let toastTimer;
@@ -220,8 +267,34 @@ function renderBoardPage(root, id) {
   let online = 0;
   let editingId = null;
   let editingActionId = null;
-  const drafts = {};
+  const drafts = Object.create(null);
   const actionDraft = { text: '', assignee: '' };
+  const cardEdits = new Map();
+  const actionEdits = new Map();
+  const pendingCards = new Set();
+  const pendingDone = new Map();
+  const pendingVotes = new Map();
+  let actionPending = false;
+  const unsent = [];
+  let composing = false;
+  let renderPending = false;
+  let renderFrame = null;
+  let disposed = false;
+  let pageGeneration = 0;
+  const requests = new Set();
+  let eventSource = null;
+  let polling = false;
+  let pollTimer = null;
+  let pollInFlight = false;
+  let pollController = null;
+  const draftStorageKey = `retro.drafts.v1:${id}:${participant}`;
+  let lastSavedDrafts = null;
+  let storageNotice = null;
+  let rejectedDraftsRaw = null;
+  let draftStorageUnreadable = false;
+  let draftWriteFailed = false;
+  let lastStoredRaw = null;
+  let draftStorageDiverged = false;
 
   const titleEl = h('h1', { class: 'board-title' });
   const chainEl = h('nav', { class: 'chain', 'aria-label': 'Ретро этой команды' });
@@ -231,6 +304,16 @@ function renderBoardPage(root, id) {
   const timerEl = h('span', { class: 'timer', role: 'timer', hidden: true });
   const statusEl = h('span', { class: 'status', hidden: true });
   const columnsEl = h('main', { class: 'columns' });
+  const recoveryEl = h('section', { 'aria-label': 'Неотправленные записи' });
+  const draftWarningEl = h('div', { class: 'draft-warning', role: 'alert', hidden: true });
+
+  // Замена DOM посреди IME прерывает ввод. Дождёмся завершения композиции
+  // и последнего input, затем покажем самое свежее состояние доски.
+  root.addEventListener('compositionstart', () => { composing = true; });
+  root.addEventListener('compositionend', () => {
+    composing = false;
+    if (renderPending) renderFrame = requestAnimationFrame(render);
+  });
 
   root.replaceChildren(
     h('header', { class: 'topbar' },
@@ -239,85 +322,415 @@ function renderBoardPage(root, id) {
       toolsEl,
     ),
     h('div', { class: 'statusline' }, hintEl, timerEl, statusEl, chainEl),
+    draftWarningEl,
+    recoveryEl,
     columnsEl,
   );
+  restoreDrafts();
+  renderRecovery();
 
   function setStatus(text) {
     statusEl.textContent = text;
     statusEl.hidden = !text;
   }
 
+  function warnStorage(kind, message) {
+    storageNotice = kind;
+    draftWarningEl.textContent = message;
+    if (kind === 'invalid') draftWarningEl.append(h('div', {}, h('button', {
+      type: 'button',
+      onclick: () => {
+        if (!confirm('Удалить сохранённые данные, которые не удалось прочитать? Текущий текст в полях останется.')) return;
+        try { sessionStorage.removeItem(draftStorageKey); }
+        catch {
+          warnStorage('invalid', 'Не удалось сбросить сохранённые данные. Новые черновики пока не записываются.');
+          return;
+        }
+        rejectedDraftsRaw = null;
+        lastSavedDrafts = null;
+        lastStoredRaw = null;
+        draftStorageDiverged = false;
+        draftStorageUnreadable = false;
+        draftWriteFailed = false;
+        storageNotice = null;
+        draftWarningEl.hidden = true;
+        persistDrafts();
+      },
+    }, 'Сбросить сохранённые черновики')));
+    if (kind === 'diverged') draftWarningEl.append(h('div', {}, h('button', {
+      type: 'button',
+      onclick: () => {
+        if (!confirm('Заменить текущие черновики сохранённой версией? Несохранённый текст в полях и очереди будет потерян. Сначала скопируйте нужное.')) return;
+        restoreDrafts(true);
+        renderRecovery();
+        // Удалённое активное поле не должно вернуть старое значение через
+        // captureFocus после явного выбора другой версии черновиков.
+        columnsEl.replaceChildren();
+        render();
+      },
+    }, 'Загрузить сохранённые черновики')));
+    draftWarningEl.hidden = false;
+  }
+
+  function draftSnapshot() {
+    const edits = (values, action) => Array.from(values, ([itemId, draft]) => [itemId, {
+      text: draft.text, ...(action ? { assignee: draft.assignee } : {}),
+      baseRevision: draft.baseRevision, uncertain: !!draft.uncertain, conflict: !!draft.conflict,
+    }]);
+    return {
+      version: 1, boardId: id, participant,
+      drafts: Object.fromEntries(Object.entries(drafts).filter(([, text]) => text !== '')),
+      actionDraft: { ...actionDraft }, editingId, editingActionId,
+      cardEdits: edits(cardEdits, false), actionEdits: edits(actionEdits, true),
+      outbox: unsent.map(({ path, body, options, error }) => ({ path, body, options, error })),
+    };
+  }
+
+  function persistDrafts() {
+    if (disposed) return;
+    // Не уничтожаем данные неизвестной версии или повреждённый снимок
+    // пустым состоянием страницы либо новым вводом без явного решения.
+    const snapshot = draftSnapshot();
+    const serialized = JSON.stringify(snapshot);
+    const empty = !Object.keys(snapshot.drafts).length && !actionDraft.text && !actionDraft.assignee
+      && !cardEdits.size && !actionEdits.size && !unsent.length;
+    if (rejectedDraftsRaw !== null || draftStorageUnreadable || draftStorageDiverged) {
+      if (serialized !== lastSavedDrafts && (lastSavedDrafts !== null || !empty)) draftWriteFailed = true;
+      return;
+    }
+    if (serialized === lastSavedDrafts) return;
+    try {
+      if (empty) sessionStorage.removeItem(draftStorageKey);
+      else sessionStorage.setItem(draftStorageKey, serialized);
+      lastSavedDrafts = serialized;
+      lastStoredRaw = empty ? null : serialized;
+      draftWriteFailed = false;
+      if (storageNotice === 'unavailable') {
+        storageNotice = null;
+        draftWarningEl.hidden = true;
+      }
+    } catch {
+      draftWriteFailed = true;
+      warnStorage('unavailable', 'Браузер не сохраняет черновики. Не закрывайте и не обновляйте эту вкладку: скопируйте важный текст.');
+    }
+  }
+
+  function restoreDrafts(discardUnsaved = false) {
+    let raw;
+    try {
+      raw = sessionStorage.getItem(draftStorageKey);
+      draftStorageUnreadable = false;
+    }
+    catch {
+      // Запись может работать при недоступном чтении. Не затираем вслепую
+      // более новый снимок другого экземпляра страницы из этой вкладки.
+      draftStorageUnreadable = true;
+      warnStorage('unavailable', 'Браузер не сохраняет черновики. Не закрывайте и не обновляйте эту вкладку: скопируйте важный текст.');
+      return;
+    }
+    // При quota/read-only storage память может содержать единственную
+    // копию текста. Возврат из BFCache не равен согласию её удалить.
+    if (!discardUnsaved && draftWriteFailed) {
+      if (raw !== lastStoredRaw) {
+        draftStorageDiverged = true;
+        warnStorage('diverged', 'Текущие черновики не удалось сохранить, а сохранённая версия изменилась на другой странице этой вкладки. Текущий текст остаётся в полях и очереди; версия в хранилище не изменена. Скопируйте нужное перед выбором версии или обновлением страницы.');
+      }
+      return;
+    }
+    const clear = () => {
+      for (const key of Object.keys(drafts)) delete drafts[key];
+      actionDraft.text = '';
+      actionDraft.assignee = '';
+      cardEdits.clear();
+      actionEdits.clear();
+      unsent.length = 0;
+      editingId = null;
+      editingActionId = null;
+      rejectedDraftsRaw = null;
+      lastSavedDrafts = null;
+      storageNotice = null;
+      draftWarningEl.hidden = true;
+      draftWriteFailed = false;
+      draftStorageDiverged = false;
+      lastStoredRaw = raw;
+    };
+    if (raw === null) { clear(); return; }
+    try {
+      const saved = JSON.parse(raw);
+      const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+      const text = (value, max = 2000) => typeof value === 'string' && Array.from(value).length <= max;
+      const identifier = value => typeof value === 'string' && /^[A-Za-z0-9-]{1,64}$/.test(value);
+      const revision = value => Number.isSafeInteger(value) && value >= 0;
+      const editsValid = (values, action) => Array.isArray(values)
+        && values.every(pair => Array.isArray(pair) && pair.length === 2 && identifier(pair[0])
+          && object(pair[1]) && text(pair[1].text) && (!action || text(pair[1].assignee, 60))
+          && revision(pair[1].baseRevision) && typeof pair[1].uncertain === 'boolean' && typeof pair[1].conflict === 'boolean')
+        && new Set(values.map(pair => pair[0])).size === values.length;
+      const outboxValid = entry => {
+        if (!object(entry) || !object(entry.body) || !object(entry.options)
+          || typeof entry.options.idempotencyKey !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(entry.options.idempotencyKey)
+          || !text(entry.body.text) || !entry.body.text.trim() || !text(entry.error, 2000)) return false;
+        if (entry.path === `/api/boards/${id}/cards`) return identifier(entry.body.columnId) && text(entry.body.author, 60);
+        if (entry.path === `/api/boards/${id}/actions`) return text(entry.body.assignee, 60);
+        return false;
+      };
+      if (!object(saved) || saved.version !== 1 || saved.boardId !== id || saved.participant !== participant
+        || !object(saved.drafts) || !Object.entries(saved.drafts).every(([key, value]) => identifier(key) && text(value))
+        || !object(saved.actionDraft) || !text(saved.actionDraft.text) || !text(saved.actionDraft.assignee, 60)
+        || !editsValid(saved.cardEdits, false) || !editsValid(saved.actionEdits, true)
+        || !Array.isArray(saved.outbox) || !saved.outbox.every(outboxValid)
+        || !(saved.editingId === null || saved.cardEdits.some(([key]) => key === saved.editingId))
+        || !(saved.editingActionId === null || saved.actionEdits.some(([key]) => key === saved.editingActionId))) {
+        throw new Error('Некорректный снимок');
+      }
+      clear();
+      Object.assign(drafts, saved.drafts);
+      actionDraft.text = saved.actionDraft.text;
+      actionDraft.assignee = saved.actionDraft.assignee;
+      const restoreEdits = (target, values) => {
+        for (const [itemId, draft] of values) target.set(itemId, {
+          text: draft.text, ...(draft.assignee !== undefined ? { assignee: draft.assignee } : {}),
+          baseRevision: draft.baseRevision, uncertain: draft.uncertain, pending: false,
+          conflict: draft.uncertain || draft.conflict ? {
+            loading: false,
+            message: draft.uncertain ? 'Предыдущее сохранение не подтверждено. Проверьте актуальную версию.' : 'Проверьте актуальную версию перед сохранением.',
+          } : null,
+        });
+      };
+      restoreEdits(cardEdits, saved.cardEdits);
+      restoreEdits(actionEdits, saved.actionEdits);
+      editingId = saved.editingId;
+      editingActionId = saved.editingActionId;
+      for (const entry of saved.outbox) unsent.push({
+        path: entry.path,
+        body: entry.path.endsWith('/cards')
+          ? { columnId: entry.body.columnId, text: entry.body.text, author: entry.body.author }
+          : { text: entry.body.text, assignee: entry.body.assignee },
+        options: { idempotencyKey: entry.options.idempotencyKey }, pending: false,
+        error: entry.error || 'Предыдущая отправка не подтверждена. Можно безопасно повторить её.',
+      });
+      lastSavedDrafts = raw;
+    } catch {
+      rejectedDraftsRaw = raw;
+      warnStorage('invalid', 'Не удалось восстановить сохранённые черновики: данные повреждены или имеют неподдерживаемый формат. Сохранённые данные не изменены; новые черновики пока не записываются.');
+    }
+  }
+
+  // HTTP и SSE могут прийти в любом порядке. Версия доски не позволяет
+  // старому ответу откатить уже показанные изменения. Счётчик подключений
+  // может измениться без новой версии самой доски.
+  function applyBoard(next) {
+    if (disposed || next.id !== id) return false;
+    if (board && (next.revision ?? 0) < (board.revision ?? 0)) return false;
+    if (next.online !== undefined) online = next.online;
+    board = next;
+    render();
+    return true;
+  }
+
+  function isCurrent(generation) {
+    return !disposed && generation === pageGeneration;
+  }
+
+  function inactiveRequest() {
+    return Object.assign(new Error('Страница уже сменилась'), { inactive: true });
+  }
+
+  async function boardRequest(method, path, body, options = {}) {
+    const generation = pageGeneration;
+    if (!isCurrent(generation)) throw inactiveRequest();
+    const controller = new AbortController();
+    const forwardAbort = () => controller.abort();
+    options.signal?.addEventListener('abort', forwardAbort, { once: true });
+    if (options.signal?.aborted) controller.abort();
+    requests.add(controller);
+    try {
+      const result = await api(method, path, body, { ...options, signal: controller.signal });
+      if (!isCurrent(generation)) throw inactiveRequest();
+      return result;
+    } catch (err) {
+      if (!isCurrent(generation)) throw inactiveRequest();
+      throw err;
+    } finally {
+      requests.delete(controller);
+      options.signal?.removeEventListener('abort', forwardAbort);
+    }
+  }
+
+  function reportError(err) {
+    if (!disposed && !err.inactive) toast(err.message);
+  }
+
+  async function mutate(method, path, body, options) {
+    const generation = pageGeneration;
+    const next = await boardRequest(method, path, body, options);
+    if (!isCurrent(generation)) throw inactiveRequest();
+    applyBoard(next);
+    return next;
+  }
+
+  async function refreshBoard(options) {
+    const generation = pageGeneration;
+    const next = await boardRequest('GET', `/api/boards/${id}`, undefined, options);
+    if (!isCurrent(generation)) throw inactiveRequest();
+    applyBoard(next);
+    return next;
+  }
+
   function canWrite() {
     return board.phase === 'write' || board.phase === 'reveal';
   }
 
-  function liveDraft(colId) {
-    return columnsEl.querySelector(`[data-keep="draft:${colId}"]`);
+  function focusField(keep) {
+    root.querySelector(`[data-keep="${CSS.escape(keep)}"]`)?.focus({ preventScroll: true });
+  }
+
+  // Неудачная отправка не возвращается поверх нового черновика. Храним
+  // исходные текст и подпись отдельно, пока пользователь не повторит её
+  // или явно не удалит. Блок живёт вне перерисовываемых колонок.
+  async function sendCreation(entry) {
+    if (entry.pending) return;
+    const generation = pageGeneration;
+    entry.pending = true;
+    persistDrafts(); // вместе с ключом операции — до первого сетевого запроса
+    renderRecovery();
+    try {
+      await mutate('POST', entry.path, entry.body, entry.options);
+      if (!isCurrent(generation)) return;
+      unsent.splice(unsent.indexOf(entry), 1);
+    } catch (err) {
+      if (!isCurrent(generation)) return;
+      entry.error = err.message;
+      reportError(err);
+    } finally {
+      if (isCurrent(generation)) {
+        entry.pending = false;
+        persistDrafts();
+        renderRecovery();
+      }
+    }
+  }
+
+  function renderRecovery() {
+    if (disposed) return;
+    if (!unsent.length) {
+      recoveryEl.replaceChildren();
+      return;
+    }
+    recoveryEl.replaceChildren(
+      h('h2', { class: 'statusline' }, 'Неотправленные записи'),
+      h('p', { class: 'statusline' }, 'Текст сохранён здесь. Можно повторить отправку.'),
+      h('div', { class: 'columns' }, unsent.map(entry => h('article', { class: 'column card' },
+        h('p', { class: 'text' }, entry.body.text),
+        h('span', { class: 'muted' }, entry.body.assignee !== undefined
+          ? `Ответственный: ${entry.body.assignee || 'не назначен'}`
+          : `Автор: ${entry.body.author || 'анонимно'}`),
+        h('p', { class: 'muted' }, entry.pending ? 'Отправка…' : entry.error),
+        h('button', {
+          type: 'button', disabled: entry.pending,
+          onclick: () => sendCreation(entry),
+        }, 'Повторить отправку'),
+        h('button', {
+          type: 'button', disabled: entry.pending,
+          onclick: () => {
+            if (!confirm('Удалить неотправленный черновик?')) return;
+            unsent.splice(unsent.indexOf(entry), 1);
+            persistDrafts();
+            renderRecovery();
+          },
+        }, 'Удалить черновик'),
+      ))),
+    );
   }
 
   // --- действия ---
 
   async function setPhase(phase) {
-    try { await api('POST', `/api/boards/${board.id}/phase`, { phase }); }
-    catch (err) { toast(err.message); }
+    try { await mutate('POST', `/api/boards/${board.id}/phase`, { phase }); }
+    catch (err) { reportError(err); }
   }
 
   async function setVoteLimit(value) {
     const n = parseInt(value, 10);
     if (!Number.isFinite(n)) return;
-    try { await api('POST', `/api/boards/${board.id}/vote-limit`, { voteLimit: n }); }
-    catch (err) { toast(err.message); }
+    try { await mutate('POST', `/api/boards/${board.id}/vote-limit`, { voteLimit: n }); }
+    catch (err) { reportError(err); }
   }
 
-  async function vote(cardId) {
-    try { await api('POST', `/api/boards/${board.id}/cards/${cardId}/vote`); }
-    catch (err) { toast(err.message); }
+  async function vote(cardId, voted) {
+    const generation = pageGeneration;
+    const card = currentItem('card', cardId);
+    if (!card) return;
+    const target = card.groupId || cardId;
+    if (pendingVotes.has(target)) return;
+    pendingVotes.set(target, voted);
+    render();
+    try { await mutate('POST', `/api/boards/${board.id}/cards/${cardId}/vote`, { voted }); }
+    catch (err) { reportError(err); }
+    finally {
+      if (isCurrent(generation)) {
+        pendingVotes.delete(target);
+        render();
+      }
+    }
   }
 
   async function groupCards(cardId, targetId) {
-    try { await api('POST', `/api/boards/${board.id}/cards/${cardId}/group`, { targetCardId: targetId }); }
-    catch (err) { toast(err.message); }
+    try { await mutate('POST', `/api/boards/${board.id}/cards/${cardId}/group`, { targetCardId: targetId }); }
+    catch (err) { reportError(err); }
   }
 
   async function ungroupCard(cardId) {
-    try { await api('DELETE', `/api/boards/${board.id}/cards/${cardId}/group`); }
-    catch (err) { toast(err.message); }
+    try { await mutate('DELETE', `/api/boards/${board.id}/cards/${cardId}/group`); }
+    catch (err) { reportError(err); }
   }
 
-  async function toggleActionDone(actionId) {
-    try { await api('POST', `/api/boards/${board.id}/actions/${actionId}/done`); }
-    catch (err) { toast(err.message); }
+  async function setActionDone(actionId, done) {
+    const generation = pageGeneration;
+    if (pendingDone.has(actionId)) return;
+    pendingDone.set(actionId, done);
+    render();
+    try { await mutate('POST', `/api/boards/${board.id}/actions/${actionId}/done`, { done }); }
+    catch (err) { reportError(err); }
+    finally {
+      if (isCurrent(generation)) {
+        pendingDone.delete(actionId);
+        render();
+      }
+    }
   }
 
   async function removeAction(action) {
     if (!confirm('Удалить решение?')) return;
-    try { await api('DELETE', `/api/boards/${board.id}/actions/${action.id}`); }
-    catch (err) { toast(err.message); }
+    try { await mutate('DELETE', `/api/boards/${board.id}/actions/${action.id}`); }
+    catch (err) { reportError(err); }
   }
 
   // minutes === 0 останавливает таймер.
   async function setTimer(minutes) {
-    try { await api('POST', `/api/boards/${board.id}/timer`, { minutes }); }
-    catch (err) { toast(err.message); }
+    try { await mutate('POST', `/api/boards/${board.id}/timer`, { minutes }); }
+    catch (err) { reportError(err); }
   }
 
   async function removeCard(card) {
     if (!confirm('Удалить карточку?')) return;
-    try { await api('DELETE', `/api/boards/${board.id}/cards/${card.id}`); }
-    catch (err) { toast(err.message); }
+    try { await mutate('DELETE', `/api/boards/${board.id}/cards/${card.id}`); }
+    catch (err) { reportError(err); }
   }
 
   // Следующее ретро: та же команда, тот же шаблон, незакрытые решения
   // переезжают. После создания переходим на новую доску.
   async function createNextBoard() {
+    const generation = pageGeneration;
     const title = prompt('Название следующего ретро', board.title);
     if (title === null) return;
     try {
-      const next = await api('POST', `/api/boards/${board.id}/next`, { title });
+      const next = await boardRequest('POST', `/api/boards/${board.id}/next`, { title });
+      if (!isCurrent(generation)) return;
       rememberBoard(next.id, next.title);
       location.href = '/b/' + next.id;
     } catch (err) {
-      toast(err.message);
+      reportError(err);
     }
   }
 
@@ -342,7 +755,12 @@ function renderBoardPage(root, id) {
   // --- рендер ---
 
   function render() {
-    if (!board) return;
+    if (!board || disposed) return;
+    if (composing) {
+      renderPending = true;
+      return;
+    }
+    renderPending = false;
     document.title = `${board.title} — Ретро`;
     titleEl.textContent = board.title;
     const saved = captureFocus();
@@ -354,6 +772,7 @@ function renderBoardPage(root, id) {
     renderColumns();
     columnsEl.scrollLeft = scrollLeft;
     restoreFocus(saved);
+    persistDrafts();
   }
 
   // Таймер считает на клиенте от timerEndsAt, который приходит с сервера и
@@ -428,10 +847,12 @@ function renderBoardPage(root, id) {
       h('summary', {}, 'История'),
       list);
     details.addEventListener('toggle', async () => {
+      const generation = pageGeneration;
       if (!details.open) return;
       list.replaceChildren(h('li', { class: 'muted' }, 'Загрузка…'));
       try {
-        const chain = await api('GET', `/api/boards/${board.id}/history`);
+        const chain = await boardRequest('GET', `/api/boards/${board.id}/history`);
+        if (!isCurrent(generation)) return;
         list.replaceChildren(...chain.map((item, i) => h('li', { class: item.current ? 'current' : '' },
           h('span', { class: 'history-num' }, `${i + 1}.`),
           item.current
@@ -441,6 +862,7 @@ function renderBoardPage(root, id) {
             new Date(item.createdAt).toLocaleDateString('ru-RU'),
             item.openActions ? ` · открытых решений: ${item.openActions}` : ''))));
       } catch (err) {
+        if (!isCurrent(generation)) return;
         list.replaceChildren(h('li', { class: 'muted' }, err.message));
       }
     });
@@ -528,7 +950,26 @@ function renderBoardPage(root, id) {
       );
     });
     const actions = renderActions();
-    columnsEl.replaceChildren(...columns, ...(actions ? [actions] : []));
+    const orphans = renderOrphanEdits();
+    columnsEl.replaceChildren(...columns, ...(actions ? [actions] : []), ...(orphans ? [orphans] : []));
+  }
+
+  // Удаление записи другим клиентом не должно убирать пользовательский
+  // черновик вместе с её карточкой. Показываем все такие редакторы отдельно,
+  // пока пользователь явно их не закроет.
+  function renderOrphanEdits() {
+    const editors = [];
+    for (const [kind, draftsById] of [['card', cardEdits], ['action', actionEdits]]) {
+      for (const [itemId, draft] of draftsById) {
+        if (currentItem(kind, itemId)) continue;
+        draft.conflict ||= { loading: false, message: 'Запись больше не существует на доске.' };
+        editors.push(kind === 'card' ? renderCardEditor({ id: itemId }) : renderActionEditor({ id: itemId }));
+      }
+    }
+    if (!editors.length) return null;
+    return h('section', { class: 'column', 'aria-label': 'Правки удалённых записей' },
+      h('header', { class: 'column-head' }, h('h2', {}, 'Правки удалённых записей')),
+      h('ul', { class: 'cards' }, editors));
   }
 
   // --- решения (action items) ---
@@ -538,7 +979,7 @@ function renderBoardPage(root, id) {
   function renderActions() {
     const open = board.phase !== 'write';
     if (!open && board.actions.length === 0) return null;
-    const done = board.actions.filter(a => a.done).length;
+    const done = board.actions.filter(a => pendingDone.get(a.id) ?? a.done).length;
     const empty = board.actions.length === 0
       ? h('p', { class: 'empty' }, 'Что команда решила сделать и кто отвечает.')
       : null;
@@ -555,17 +996,22 @@ function renderBoardPage(root, id) {
   function renderAction(action) {
     if (editingActionId === action.id) return renderActionEditor(action);
     const editable = action.mine || board.isOwner;
+    const done = pendingDone.get(action.id) ?? action.done;
     const checkbox = h('input', {
-      type: 'checkbox', checked: action.done, disabled: !editable,
-      'aria-label': action.done ? 'Сделано' : 'Не сделано',
-      onchange: () => toggleActionDone(action.id),
+      type: 'checkbox', checked: done, disabled: !editable || pendingDone.has(action.id),
+      'aria-label': done ? 'Сделано' : 'Не сделано',
+      onchange: e => setActionDone(action.id, e.target.checked),
     });
     const controls = [];
     if (editable) {
-      controls.push(h('button', { type: 'button', class: 'link', onclick: () => { editingActionId = action.id; render(); } }, 'Изменить'));
+      controls.push(h('button', { type: 'button', class: 'link', onclick: () => {
+        editingActionId = action.id;
+        render();
+        focusField('action-edit:' + action.id);
+      } }, 'Изменить'));
       controls.push(h('button', { type: 'button', class: 'link danger', onclick: () => removeAction(action) }, 'Удалить'));
     }
-    return h('li', { class: 'card action' + (action.done ? ' done' : '') },
+    return h('li', { class: 'card action' + (done ? ' done' : '') },
       h('div', { class: 'action-row' },
         checkbox,
         h('p', { class: 'text' }, action.text)),
@@ -580,75 +1026,187 @@ function renderBoardPage(root, id) {
     const text = h('textarea', {
       rows: 2, maxlength: 2000, placeholder: 'Что сделать',
       value: actionDraft.text, dataset: { keep: 'action-text' },
-      oninput: e => { actionDraft.text = e.target.value; },
+      oninput: e => { actionDraft.text = e.target.value; persistDrafts(); },
       onkeydown: e => {
+        if (e.isComposing) return;
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
       },
     });
     const assignee = h('input', {
       type: 'text', maxlength: 60, placeholder: 'Ответственный',
       value: actionDraft.assignee, dataset: { keep: 'action-assignee' },
-      oninput: e => { actionDraft.assignee = e.target.value; },
-      onkeydown: e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } },
+      oninput: e => { actionDraft.assignee = e.target.value; persistDrafts(); },
+      onkeydown: e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); } },
     });
-    const btn = h('button', { type: 'button', class: 'primary small', onclick: submit }, 'Записать');
+    const btn = h('button', {
+      type: 'button', class: 'primary small', disabled: actionPending,
+      dataset: { send: 'action' }, onclick: submit,
+    }, 'Записать');
 
     async function submit() {
+      const generation = pageGeneration;
+      if (actionPending) return;
       const value = text.value.trim();
       if (!value) return;
       const who = assignee.value.trim();
       actionDraft.text = '';
       text.value = '';
+      actionPending = true;
       btn.disabled = true;
+      text.focus();
+      const path = `/api/boards/${board.id}/actions`;
+      const body = { text: value, assignee: who };
+      const options = { idempotencyKey: randomId() };
+      const entry = { path, body, options, error: '', pending: false };
+      unsent.push(entry);
       try {
-        await api('POST', `/api/boards/${board.id}/actions`, { text: value, assignee: who });
-      } catch (err) {
-        actionDraft.text = value;
-        const live = columnsEl.querySelector('[data-keep="action-text"]');
-        if (live) live.value = value;
-        toast(err.message);
+        await sendCreation(entry);
       } finally {
-        btn.disabled = false;
-        const live = columnsEl.querySelector('[data-keep="action-text"]');
-        if (live) live.focus();
+        if (isCurrent(generation)) {
+          actionPending = false;
+          const live = columnsEl.querySelector('[data-send="action"]');
+          if (live) live.disabled = false;
+        }
       }
     }
     return h('div', { class: 'composer' }, text, h('div', { class: 'composer-row' }, assignee, btn));
   }
 
+  function currentItem(kind, itemId) {
+    return kind === 'action'
+      ? board.actions.find(a => a.id === itemId)
+      : board.columns.flatMap(col => col.cards).find(card => card.id === itemId);
+  }
+
+  async function loadConflict(draft, kind, itemId, expectedRevision, message) {
+    const generation = pageGeneration;
+    draft.conflict = { loading: true, expectedRevision, message };
+    render();
+    try {
+      await refreshBoard();
+      if (!isCurrent(generation)) return;
+      draft.conflict.loading = false;
+    } catch (err) {
+      if (!isCurrent(generation)) return;
+      draft.conflict.loading = false;
+      draft.conflict.error = err.message;
+    }
+    render();
+  }
+
+  function renderConflict(draft, kind, itemId, save) {
+    const conflict = draft.conflict;
+    if (!conflict) return null;
+    const latest = currentItem(kind, itemId);
+    const waiting = draft.pending || conflict.loading;
+    return h('div', { class: 'edit-conflict', role: 'status' },
+      h('strong', {}, draft.uncertain ? 'Не удалось подтвердить сохранение' : 'Не удалось сохранить изменения'),
+      h('p', {}, conflict.message),
+      h('p', {}, 'Ваши правки остались в редакторе. Выберите, какую версию сохранить.'),
+      conflict.loading ? h('p', {}, 'Загружаем актуальную версию…')
+        : conflict.error ? h('p', {}, conflict.error)
+        : latest ? h('div', {},
+          h('strong', {}, 'Сейчас на доске'),
+          h('p', { class: 'text' }, latest.text),
+          kind === 'action' ? h('p', {}, `Ответственный: ${latest.assignee || 'не назначен'}`) : null)
+        : h('p', {}, 'Запись уже удалена. Скопируйте нужный текст из редактора.'),
+      conflict.error ? h('button', {
+        type: 'button', disabled: waiting,
+        onclick: () => loadConflict(draft, kind, itemId, conflict.expectedRevision, conflict.message),
+      }, 'Обновить актуальную версию') : null,
+      latest && !conflict.error && !conflict.loading ? h('div', { class: 'conflict-actions' },
+        h('button', {
+          type: 'button', disabled: waiting,
+          onclick: () => {
+            draft.text = latest.text;
+            if (kind === 'action') draft.assignee = latest.assignee;
+            draft.baseRevision = latest.revision ?? 0;
+            draft.uncertain = false;
+            draft.conflict = null;
+            render();
+            focusField((kind === 'action' ? 'action-edit:' : 'edit:') + itemId);
+          },
+        }, 'Загрузить актуальную версию'),
+        h('button', {
+          type: 'button', disabled: waiting,
+          onclick: () => save(latest.revision ?? 0),
+        }, 'Сохранить мой вариант поверх')) : null,
+    );
+  }
+
   function renderActionEditor(action) {
+    if (!actionEdits.has(action.id)) {
+      actionEdits.set(action.id, {
+        text: action.text, assignee: action.assignee,
+        baseRevision: action.revision ?? 0, pending: false, conflict: null,
+      });
+    }
+    const draft = actionEdits.get(action.id);
     const text = h('textarea', {
-      rows: 3, maxlength: 2000, value: action.text, dataset: { keep: 'action-edit:' + action.id },
+      rows: 3, maxlength: 2000, value: draft.text, disabled: draft.pending,
+      dataset: { keep: 'action-edit:' + action.id },
+      oninput: e => { draft.text = e.target.value; persistDrafts(); },
       onkeydown: e => {
+        if (e.isComposing) return;
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
         if (e.key === 'Escape') { cancel(); }
       },
     });
     const assignee = h('input', {
-      type: 'text', maxlength: 60, placeholder: 'Ответственный', value: action.assignee,
+      type: 'text', maxlength: 60, placeholder: 'Ответственный', value: draft.assignee, disabled: draft.pending,
       dataset: { keep: 'action-edit-assignee:' + action.id },
+      oninput: e => { draft.assignee = e.target.value; persistDrafts(); },
       onkeydown: e => {
+        if (e.isComposing) return;
         if (e.key === 'Enter') { e.preventDefault(); save(); }
         if (e.key === 'Escape') { cancel(); }
       },
     });
-    const cancel = () => { editingActionId = null; render(); };
-    const save = async () => {
-      const value = text.value.trim();
-      if (!value) return;
+    const cancel = () => {
+      if (draft.pending) return;
+      actionEdits.delete(action.id);
+      if (editingActionId === action.id) editingActionId = null;
+      render();
+    };
+    const save = async (expectedRevision) => {
+      const generation = pageGeneration;
+      const value = draft.text.trim();
+      if (!value || draft.pending || (draft.conflict && expectedRevision === undefined)) return;
+      const revision = expectedRevision ?? draft.baseRevision;
+      draft.pending = true;
+      draft.uncertain = true;
+      render();
       try {
-        await api('PATCH', `/api/boards/${board.id}/actions/${action.id}`, { text: value, assignee: assignee.value.trim() });
-        editingActionId = null;
-        render();
+        await mutate('PATCH', `/api/boards/${board.id}/actions/${action.id}`, {
+          text: value, assignee: draft.assignee.trim(), revision,
+        });
+        if (!isCurrent(generation)) return;
+        draft.uncertain = false;
+        // Более новый SSE мог сообщить об удалении уже после применения
+        // PATCH на сервере. Сохраняем доступ к тексту и в этом случае.
+        if (currentItem('action', action.id)) {
+          actionEdits.delete(action.id);
+          if (editingActionId === action.id) editingActionId = null;
+        }
       } catch (err) {
-        toast(err.message);
+        if (!isCurrent(generation)) return;
+        draft.uncertain = !!err.unknownOutcome;
+        draft.pending = false;
+        if (err.status === 409 || draft.uncertain) await loadConflict(draft, 'action', action.id, revision, err.message);
+        else toast(err.message);
+      } finally {
+        if (isCurrent(generation)) {
+          draft.pending = false;
+          render();
+        }
       }
     };
     const el = h('li', { class: 'card editing' }, text, assignee,
+      renderConflict(draft, 'action', action.id, save),
       h('div', { class: 'card-actions' },
-        h('button', { type: 'button', class: 'primary small', onclick: save }, 'Сохранить'),
-        h('button', { type: 'button', class: 'small', onclick: cancel }, 'Отмена')));
-    queueMicrotask(() => { if (document.activeElement !== text) text.focus(); });
+        h('button', { type: 'button', class: 'primary small', disabled: draft.pending || !!draft.conflict, onclick: () => save() }, 'Сохранить'),
+        h('button', { type: 'button', class: 'small', disabled: draft.pending, onclick: cancel },
+          currentItem('action', action.id) ? 'Отмена' : 'Закрыть черновик')));
     return el;
   }
 
@@ -656,32 +1214,42 @@ function renderBoardPage(root, id) {
     const ta = h('textarea', {
       rows: 2, maxlength: 2000, placeholder: 'Новая карточка',
       value: drafts[col.id] || '', dataset: { keep: 'draft:' + col.id },
-      oninput: e => { drafts[col.id] = e.target.value; },
+      oninput: e => { drafts[col.id] = e.target.value; persistDrafts(); },
       onkeydown: e => {
+        if (e.isComposing) return;
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
       },
     });
-    const btn = h('button', { type: 'button', class: 'primary small', onclick: submit }, 'Добавить');
+    const btn = h('button', {
+      type: 'button', class: 'primary small', disabled: pendingCards.has(col.id),
+      dataset: { send: 'card:' + col.id }, onclick: submit,
+    }, 'Добавить');
 
     async function submit() {
+      const generation = pageGeneration;
+      if (pendingCards.has(col.id)) return;
       const text = ta.value.trim();
       if (!text) return;
       // Очищаем до запроса: событие SSE может перерисовать колонку раньше,
       // чем вернётся ответ, и новая textarea возьмёт текст из drafts.
       drafts[col.id] = '';
       ta.value = '';
+      pendingCards.add(col.id);
       btn.disabled = true;
+      ta.focus();
+      const path = `/api/boards/${board.id}/cards`;
+      const body = { columnId: col.id, text, author: authorName() };
+      const options = { idempotencyKey: randomId() };
+      const entry = { path, body, options, error: '', pending: false };
+      unsent.push(entry);
       try {
-        await api('POST', `/api/boards/${board.id}/cards`, { columnId: col.id, text, author: authorName() });
-      } catch (err) {
-        drafts[col.id] = text;
-        const live = liveDraft(col.id);
-        if (live) live.value = text;
-        toast(err.message);
+        await sendCreation(entry);
       } finally {
-        btn.disabled = false;
-        const live = liveDraft(col.id);
-        if (live) live.focus();
+        if (isCurrent(generation)) {
+          pendingCards.delete(col.id);
+          const live = columnsEl.querySelector(`[data-send="card:${CSS.escape(col.id)}"]`);
+          if (live) live.disabled = false;
+        }
       }
     }
     return h('div', { class: 'composer' }, ta, btn);
@@ -714,11 +1282,13 @@ function renderBoardPage(root, id) {
 
   function voteControl(voted, count, cardId) {
     if (board.phase === 'vote') {
+      const target = currentItem('card', cardId)?.groupId || cardId;
+      const selected = pendingVotes.get(target) ?? voted;
       return h('button', {
-        type: 'button', class: 'vote' + (voted ? ' voted' : ''),
-        'aria-pressed': voted ? 'true' : 'false',
-        title: voted ? 'Снять голос' : 'Отдать голос',
-        onclick: () => vote(cardId),
+        type: 'button', class: 'vote' + (selected ? ' voted' : ''), disabled: pendingVotes.has(target),
+        'aria-pressed': selected ? 'true' : 'false',
+        title: selected ? 'Снять голос' : 'Отдать голос',
+        onclick: () => vote(cardId, !voted),
       }, h('i', { class: 'dot' }), String(count));
     }
     if (board.phase === 'discuss') {
@@ -791,7 +1361,11 @@ function renderBoardPage(root, id) {
       actions.push(h('button', { type: 'button', class: 'link', onclick: () => ungroupCard(card.id) }, 'Из группы'));
     }
     if (editable) {
-      actions.push(h('button', { type: 'button', class: 'link', onclick: () => { editingId = card.id; render(); } }, 'Изменить'));
+      actions.push(h('button', { type: 'button', class: 'link', onclick: () => {
+        editingId = card.id;
+        render();
+        focusField('edit:' + card.id);
+      } }, 'Изменить'));
     }
     if (deletable) {
       actions.push(h('button', { type: 'button', class: 'link danger', onclick: () => removeCard(card) }, 'Удалить'));
@@ -808,55 +1382,175 @@ function renderBoardPage(root, id) {
   }
 
   function renderCardEditor(card) {
+    if (!cardEdits.has(card.id)) cardEdits.set(card.id, {
+      text: card.text, baseRevision: card.revision ?? 0, pending: false, conflict: null,
+    });
+    const draft = cardEdits.get(card.id);
     const ta = h('textarea', {
-      rows: 3, maxlength: 2000, value: card.text, dataset: { keep: 'edit:' + card.id },
+      rows: 3, maxlength: 2000, value: draft.text, disabled: draft.pending,
+      dataset: { keep: 'edit:' + card.id },
+      oninput: e => { draft.text = e.target.value; persistDrafts(); },
       onkeydown: e => {
+        if (e.isComposing) return;
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
         if (e.key === 'Escape') { cancel(); }
       },
     });
-    const cancel = () => { editingId = null; render(); };
-    const save = async () => {
-      const text = ta.value.trim();
-      if (!text) return;
+    const cancel = () => {
+      if (draft.pending) return;
+      cardEdits.delete(card.id);
+      if (editingId === card.id) editingId = null;
+      render();
+    };
+    const save = async (expectedRevision) => {
+      const generation = pageGeneration;
+      const text = draft.text.trim();
+      if (!text || draft.pending || (draft.conflict && expectedRevision === undefined)) return;
+      const revision = expectedRevision ?? draft.baseRevision;
+      draft.pending = true;
+      draft.uncertain = true;
+      render();
       try {
-        await api('PATCH', `/api/boards/${board.id}/cards/${card.id}`, { text });
-        editingId = null;
-        render();
+        await mutate('PATCH', `/api/boards/${board.id}/cards/${card.id}`, { text, revision });
+        if (!isCurrent(generation)) return;
+        draft.uncertain = false;
+        if (currentItem('card', card.id)) {
+          cardEdits.delete(card.id);
+          if (editingId === card.id) editingId = null;
+        }
       } catch (err) {
-        toast(err.message);
+        if (!isCurrent(generation)) return;
+        draft.uncertain = !!err.unknownOutcome;
+        draft.pending = false;
+        if (err.status === 409 || draft.uncertain) await loadConflict(draft, 'card', card.id, revision, err.message);
+        else toast(err.message);
+      } finally {
+        if (isCurrent(generation)) {
+          draft.pending = false;
+          render();
+        }
       }
     };
     const el = h('li', { class: 'card editing' }, ta,
+      renderConflict(draft, 'card', card.id, save),
       h('div', { class: 'card-actions' },
-        h('button', { type: 'button', class: 'primary small', onclick: save }, 'Сохранить'),
-        h('button', { type: 'button', class: 'small', onclick: cancel }, 'Отмена')));
-    queueMicrotask(() => { if (document.activeElement !== ta) ta.focus(); });
+        h('button', { type: 'button', class: 'primary small', disabled: draft.pending || !!draft.conflict, onclick: () => save() }, 'Сохранить'),
+        h('button', { type: 'button', class: 'small', disabled: draft.pending, onclick: cancel },
+          currentItem('card', card.id) ? 'Отмена' : 'Закрыть черновик')));
     return el;
   }
 
   // --- подключение ---
 
-  function connect() {
-    const es = new EventSource(`/api/boards/${id}/events?participant=${participant}`);
-    es.addEventListener('board', e => {
-      const data = JSON.parse(e.data);
-      online = data.online;
-      board = data;
-      setStatus('');
-      render();
-    });
-    es.onopen = () => setStatus('');
-    es.onerror = () => setStatus('Нет связи с сервером, переподключение…');
+  function stopPolling() {
+    polling = false;
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    pollController?.abort();
   }
 
-  (async () => {
+  async function pollBoard() {
+    if (!polling || disposed || pollInFlight) return;
+    const generation = pageGeneration;
+    pollInFlight = true;
+    const controller = new AbortController();
+    pollController = controller;
+    const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-      board = await api('GET', `/api/boards/${id}`);
+      await refreshBoard({ signal: controller.signal });
+    } catch {
+      // Статус потери связи уже показан; следующий запрос повторится позже.
+    } finally {
+      clearTimeout(timeout);
+      if (isCurrent(generation)) {
+        pollInFlight = false;
+        pollController = null;
+        if (polling) pollTimer = setTimeout(pollBoard, 3000);
+      }
+    }
+  }
+
+  function startPolling() {
+    if (polling || disposed) return;
+    polling = true;
+    setStatus('Нет связи с обновлениями, проверяем доску каждые 3 секунды…');
+    pollBoard();
+  }
+
+  function connect() {
+    eventSource?.close();
+    const stream = new EventSource(`/api/boards/${id}/events?participant=${participant}`);
+    eventSource = stream;
+    stream.addEventListener('board', e => {
+      if (disposed || eventSource !== stream) return;
+      const data = JSON.parse(e.data);
+      stopPolling();
+      setStatus('');
+      applyBoard(data);
+    });
+    // Открытый поток может ещё буферизоваться прокси: останавливаем GET
+    // только после реального события board, а не при onopen.
+    stream.onerror = () => { if (eventSource === stream) startPolling(); };
+  }
+
+  window.addEventListener('pagehide', () => {
+    persistDrafts();
+    disposed = true;
+    pageGeneration++;
+    for (const controller of requests) controller.abort();
+    stopPolling();
+    clearInterval(timerInterval);
+    timerInterval = null;
+    cancelAnimationFrame(renderFrame);
+    eventSource?.close();
+    eventSource = null;
+  });
+  window.addEventListener('pageshow', e => {
+    if (!e.persisted) return;
+    // Другой экземпляр этой доски в истории вкладки мог изменить или
+    // удалить сохранённые черновики. Его снимок теперь актуальнее памяти
+    // страницы из BFCache. Старые запросы уже отменены и сменили поколение.
+    pendingCards.clear();
+    pendingDone.clear();
+    pendingVotes.clear();
+    actionPending = false;
+    pollInFlight = false;
+    pollController = null;
+    composing = false;
+    renderPending = false;
+    for (const entry of unsent) {
+      entry.pending = false;
+      entry.error ||= 'Предыдущая отправка не подтверждена. Можно безопасно повторить её.';
+    }
+    for (const draft of [...cardEdits.values(), ...actionEdits.values()]) {
+      draft.pending = false;
+      if (draft.uncertain) draft.conflict = {
+        loading: false, message: 'Предыдущее сохранение не подтверждено. Проверьте актуальную версию.',
+      };
+    }
+    restoreDrafts();
+    disposed = false;
+    renderRecovery();
+    // До свежего HTTP/SSE снимка нельзя предлагать повтор PATCH по старой
+    // версии. Удаляем и прежнее активное поле: captureFocus не должен
+    // вернуть его устаревший текст поверх восстановленного черновика.
+    columnsEl.replaceChildren(h('p', { class: 'muted' }, 'Обновляем доску…'));
+    toolsEl.replaceChildren();
+    phaseNav.replaceChildren();
+    chainEl.replaceChildren();
+    connect();
+    refreshBoard().catch(err => { if (!err.inactive) startPolling(); });
+  });
+
+  (async () => {
+    const generation = pageGeneration;
+    try {
+      await refreshBoard();
+      if (!isCurrent(generation)) return;
       rememberBoard(board.id, board.title);
-      render();
       connect();
     } catch (err) {
+      if (!isCurrent(generation)) return;
       const missing = err.status === 404;
       root.replaceChildren(h('div', { class: 'notfound' },
         h('h1', {}, missing ? 'Доска не найдена' : 'Не удалось открыть доску'),
@@ -869,6 +1563,9 @@ function renderBoardPage(root, id) {
 // ---------- Маршрутизация ----------
 
 document.addEventListener('DOMContentLoaded', () => {
+  if (identity.warning) document.body.prepend(h('div', {
+    class: 'identity-warning', role: 'alert', dataset: { ui: 'identity-warning' },
+  }, identity.warning));
   const root = document.getElementById('app');
   const m = location.pathname.match(/^\/b\/([A-Za-z0-9]+)\/?$/);
   if (m) renderBoardPage(root, m[1]);

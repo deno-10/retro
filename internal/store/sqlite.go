@@ -62,11 +62,36 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 
 // Create сохраняет новую доску. Повторный id — ошибка, как и в JSONStore.
 func (s *SQLiteStore) Create(b *model.Board) error {
+	return s.CreateMany([]*model.Board{b})
+}
+
+// CreateMany сохраняет весь набор в одной транзакции, включая импорт.
+func (s *SQLiteStore) CreateMany(boards []*model.Board) error {
+	if len(boards) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // после Commit откат — no-op
+	for _, b := range boards {
+		if err := insertBoard(tx, b); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func insertBoard(tx *sql.Tx, b *model.Board) error {
+	if b == nil {
+		return fmt.Errorf("%w: доска не задана", model.ErrInvalid)
+	}
 	data, err := json.Marshal(b)
 	if err != nil {
 		return err
 	}
-	res, err := s.db.Exec(
+	res, err := tx.Exec(
 		`INSERT OR IGNORE INTO boards (id, data, created_at, updated_at) VALUES (?, ?, ?, ?)`,
 		b.ID, string(data), ts(b.CreatedAt), ts(b.UpdatedAt),
 	)
@@ -81,6 +106,35 @@ func (s *SQLiteStore) Create(b *model.Board) error {
 		return fmt.Errorf("доска %s уже существует", b.ID)
 	}
 	return nil
+}
+
+// CreateNext сохраняет ссылку на следующее ретро и новую доску одной транзакцией.
+func (s *SQLiteStore) CreateNext(prevID, title, actorID string) (*model.Board, error) {
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck // после Commit откат — no-op
+	prev, err := readBoard(tx, prevID)
+	if err != nil {
+		return nil, err
+	}
+	next, err := prev.NextBoard(title, actorID)
+	if err != nil {
+		return nil, err
+	}
+	prev.NextID = next.ID
+	prev.Revision++
+	if err := updateBoard(tx, prevID, prev); err != nil {
+		return nil, err
+	}
+	if err := insertBoard(tx, next); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return next, nil
 }
 
 // Get возвращает копию доски: объект собран из JSON только что и ни с кем
@@ -107,30 +161,16 @@ func (s *SQLiteStore) Update(id string, fn func(b *model.Board) error) (*model.B
 	}
 	defer tx.Rollback() //nolint:errcheck // после Commit откат — no-op
 
-	var data string
-	err = tx.QueryRow(`SELECT data FROM boards WHERE id = ?`, id).Scan(&data)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, model.ErrNotFound
-	case err != nil:
-		return nil, err
-	}
-	b, err := decodeBoard(data)
+	b, err := readBoard(tx, id)
 	if err != nil {
 		return nil, err
 	}
+	revision := b.Revision
 	if err := fn(b); err != nil {
 		return nil, err
 	}
-	b.UpdatedAt = time.Now()
-	out, err := json.Marshal(b)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(
-		`UPDATE boards SET data = ?, updated_at = ? WHERE id = ?`,
-		string(out), ts(b.UpdatedAt), id,
-	); err != nil {
+	b.Revision = revision + 1
+	if err := updateBoard(tx, id, b); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -139,6 +179,31 @@ func (s *SQLiteStore) Update(id string, fn func(b *model.Board) error) (*model.B
 	// b — свежий объект из этой транзакции, вовне он больше не нужен,
 	// поэтому отдаём его как копию.
 	return b, nil
+}
+
+func readBoard(tx *sql.Tx, id string) (*model.Board, error) {
+	var data string
+	err := tx.QueryRow(`SELECT data FROM boards WHERE id = ?`, id).Scan(&data)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, model.ErrNotFound
+	case err != nil:
+		return nil, err
+	}
+	return decodeBoard(data)
+}
+
+func updateBoard(tx *sql.Tx, id string, b *model.Board) error {
+	b.UpdatedAt = time.Now()
+	out, err := json.Marshal(b)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(
+		`UPDATE boards SET data = ?, updated_at = ? WHERE id = ?`,
+		string(out), ts(b.UpdatedAt), id,
+	)
+	return err
 }
 
 // Empty сообщает, что в базе нет ни одной доски. Нужен для разового импорта

@@ -371,6 +371,8 @@ button.phase:hover:not(:disabled) { background: var(--brand-soft); color: var(--
 .timer[hidden] { display: none; }
 .status { color: var(--danger); font-weight: 600; }
 .status[hidden] { display: none; }
+.draft-warning, .identity-warning { margin: 12px 24px; padding: 12px; border: 1px solid var(--danger); border-radius: 12px; color: var(--danger); background: var(--surface); }
+.draft-warning[hidden] { display: none; }
 
 /* Цепочка ретро одной команды */
 .chain { display: flex; align-items: center; gap: 12px; font-size: 13px; white-space: nowrap; margin-left: auto; }
@@ -506,6 +508,9 @@ a.history-title:hover { color: var(--brand); }
 .card.editing textarea { width: 100%; resize: vertical; min-height: 72px; }
 .card.editing .card-actions { justify-content: flex-end; gap: 8px; }
 .card.editing input[type=text] { width: 100%; padding: 8px 10px; font-size: 14px; }
+.edit-conflict { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--brand); border-radius: 12px; background: var(--brand-soft); }
+.edit-conflict p { margin: 0; }
+.conflict-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .composer { display: grid; gap: 8px; }
 .composer textarea { width: 100%; resize: vertical; min-height: 60px; }
