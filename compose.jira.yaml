@@ -1,0 +1,23 @@
+# Подключать вместе с compose.yaml после заполнения .env и файла токена.
+services:
+  retro:
+    environment:
+      JIRA_BASE_URL: ${JIRA_BASE_URL:?Укажите адрес Jira}
+      JIRA_DEPLOYMENT: ${JIRA_DEPLOYMENT:-datacenter}
+      JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:?Укажите ключ проекта Jira}
+      JIRA_ISSUE_TYPE_ID: ${JIRA_ISSUE_TYPE_ID:?Укажите ID типа задачи Jira}
+      JIRA_AUTH_MODE: ${JIRA_AUTH_MODE:-bearer}
+      JIRA_USER: ${JIRA_USER:-}
+      JIRA_TOKEN_FILE: /run/secrets/jira_token
+      JIRA_EXTRA_FIELDS: ${JIRA_EXTRA_FIELDS:-}
+      RETRO_PUBLIC_URL: https://${RETRO_DOMAIN}
+    secrets: [jira_token]
+    networks: [backend, jira_egress]
+
+secrets:
+  jira_token:
+    file: ./deploy/secrets/jira_token
+
+networks:
+  # Исходящий HTTPS для Jira. Порты приложения по-прежнему не публикуются.
+  jira_egress:

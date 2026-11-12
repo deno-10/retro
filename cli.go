@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"retro/internal/jira"
 	"retro/internal/server"
 	"retro/internal/store"
 )
@@ -51,6 +52,11 @@ func runCLI(ctx context.Context, args []string, out, errOut io.Writer) error {
 				opts.TrustedProxy = p
 			}
 			var handler slog.Handler = slog.NewTextHandler(out, nil)
+			client, err := jira.FromEnv()
+			if err != nil {
+				return err
+			}
+			opts.Jira = client
 			if *jsonLog {
 				handler = slog.NewJSONHandler(out, nil)
 			}

@@ -21,13 +21,14 @@ import (
 
 // Server держит зависимости обработчиков.
 type Server struct {
-	store   store.Store
-	hub     *hub.Hub
-	log     *slog.Logger
-	index   []byte
-	options Options
-	traffic *trafficGuard
-	stats   *metrics
+	store     store.Store
+	hub       *hub.Hub
+	log       *slog.Logger
+	index     []byte
+	options   Options
+	traffic   *trafficGuard
+	stats     *metrics
+	jiraSlots chan struct{}
 
 	// timers — запланированные срабатывания таймеров фаз по id доски.
 	// Планировщик живёт в памяти процесса; после рестарта таймеры
@@ -64,6 +65,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	}
 	s.traffic = newTrafficGuard(s.options)
 	s.stats = &metrics{started: time.Now()}
+	s.jiraSlots = make(chan struct{}, 4)
 
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", s.handleHealth)
@@ -86,6 +88,8 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	m.HandleFunc("POST /api/boards/{id}/cards/{cardId}/group", s.handleGroupCard)
 	m.HandleFunc("DELETE /api/boards/{id}/cards/{cardId}/group", s.handleUngroupCard)
 	m.HandleFunc("POST /api/boards/{id}/actions", s.handleAddAction)
+	m.HandleFunc("POST /api/boards/{id}/actions/{actionId}/jira", s.handleCreateJira)
+	m.HandleFunc("POST /api/boards/{id}/actions/{actionId}/jira/check", s.handleCheckJira)
 	m.HandleFunc("PATCH /api/boards/{id}/actions/{actionId}", s.handleEditAction)
 	m.HandleFunc("DELETE /api/boards/{id}/actions/{actionId}", s.handleDeleteAction)
 	m.HandleFunc("POST /api/boards/{id}/actions/{actionId}/done", s.handleSetActionDone)
@@ -165,10 +169,20 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 // mutate применяет изменение к доске, оповещает подписчиков и отвечает
 // актуальным представлением доски для участника.
 func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn func(b *model.Board, pid string) error) {
-	pid, err := participant(r)
+	b, pid, err := s.updateBoard(r, fn)
 	if err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	writeJSON(w, http.StatusOK, s.view(b, pid))
+}
+
+// updateBoard также используется для двух коротких транзакций вокруг запроса
+// к Jira. Сетевой вызов никогда не выполняется под блокировкой хранилища.
+func (s *Server) updateBoard(r *http.Request, fn func(b *model.Board, pid string) error) (*model.Board, string, error) {
+	pid, err := participant(r)
+	if err != nil {
+		return nil, pid, err
 	}
 	id := r.PathValue("id")
 	var operationErr error
@@ -199,18 +213,16 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn func(b *model
 		b, err = s.store.Get(id)
 	}
 	if err != nil {
-		s.writeErr(w, err)
-		return
+		return nil, pid, err
 	}
 	if !replayed {
 		s.hub.Notify(id)
 	}
 	b = s.syncTimer(b)
 	if operationErr != nil && !errors.Is(operationErr, errMutationReplayed) {
-		s.writeErr(w, operationErr)
-		return
+		return nil, pid, operationErr
 	}
-	writeJSON(w, http.StatusOK, b.View(pid))
+	return b, pid, nil
 }
 
 // mutateOnce сохраняет результат создания и ключ повтора в том же Update.
@@ -417,7 +429,7 @@ func (s *Server) handleCreateBoard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("доска создана", "board", b.ID, "template", b.Template)
-	writeJSON(w, http.StatusCreated, b.View(pid))
+	writeJSON(w, http.StatusCreated, s.view(b, pid))
 }
 
 func (s *Server) handleGetBoard(w http.ResponseWriter, r *http.Request) {
@@ -432,7 +444,7 @@ func (s *Server) handleGetBoard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b = s.syncTimer(b) // после рестарта здесь таймер встаёт на место
-	writeJSON(w, http.StatusOK, b.View(pid))
+	writeJSON(w, http.StatusOK, s.view(b, pid))
 }
 
 func (s *Server) handleAddCard(w http.ResponseWriter, r *http.Request) {
@@ -627,7 +639,7 @@ func (s *Server) handleNextBoard(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hub.Notify(prevID)
 	s.log.Info("создано следующее ретро", "board", next.ID, "prev", prevID)
-	writeJSON(w, http.StatusCreated, next.View(pid))
+	writeJSON(w, http.StatusCreated, s.view(next, pid))
 }
 
 // historyItem — одно ретро в цепочке команды.
@@ -763,7 +775,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		payload := struct {
 			model.BoardView
 			Online int `json:"online"`
-		}{b.View(pid), s.hub.Count(id)}
+		}{s.view(b, pid), s.hub.Count(id)}
 		data, err := json.Marshal(payload)
 		if err != nil {
 			return false

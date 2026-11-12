@@ -159,6 +159,14 @@ function dots(n) {
     Array.from({ length: n }, () => h('i', { class: 'dot' })));
 }
 
+function brandLink(className = '') {
+  return h('a', { href: '/', class: `brand-link ${className}`, 'aria-label': 'Ретро — на главную' },
+    h('span', { class: 'brand-mark', 'aria-hidden': 'true' },
+      Array.from({ length: 4 }, () => h('i'))),
+    h('span', { class: 'brand-name' }, 'ретро'),
+    h('span', { class: 'brand-team', 'aria-hidden': 'true' }, 'team'));
+}
+
 // Перерисовка заменяет DOM целиком. Чтобы набираемый текст и фокус не
 // пропадали, поля помечены data-keep: перед рендером запоминаем активное
 // поле, после — возвращаем в него значение, фокус и курсор.
@@ -199,10 +207,11 @@ async function renderHome(root) {
     placeholder: 'Например: Ретро спринта 42',
   });
   const select = h('select', {});
-  const submit = h('button', { type: 'submit', class: 'primary' }, 'Создать доску');
+  const submit = h('button', { type: 'submit', class: 'primary' }, 'Создать доску',
+    h('span', { class: 'button-arrow', 'aria-hidden': 'true' }, '↗'));
 
   const form = h('form', {
-    class: 'create',
+    class: 'create', id: 'new-board',
     onsubmit: async (e) => {
       e.preventDefault();
       store(NAME_KEY, nameInput.value.trim());
@@ -217,27 +226,53 @@ async function renderHome(root) {
       }
     },
   },
-    h('h2', {}, 'Новая доска'),
+    h('div', { class: 'create-heading' },
+      h('span', { class: 'form-eyebrow' }, 'Новая доска'),
+      h('h2', {}, 'Начнём ретро'),
+      h('p', { class: 'muted' }, 'Создайте доску и пригласите команду по ссылке.')),
     h('label', {}, 'Название', titleInput),
     h('label', {}, 'Шаблон', select),
     h('label', {}, 'Ваше имя', nameInput),
     submit,
+    h('p', { class: 'form-note' }, 'Можно писать анонимно. Вы решаете, когда открыть карточки.'),
   );
 
   const hero = h('section', { class: 'hero' },
-    h('span', { class: 'eyebrow' }, 'Ретроспектива спринта'),
-    h('h1', {}, 'Обсудите спринт ', h('em', {}, 'честно'), ' и решите, что менять'),
-    h('p', { class: 'lead' }, 'Создайте доску и отправьте команде ссылку. Без регистрации, изменения видны всем сразу.'),
-    h('ul', { class: 'features', 'aria-label': 'Что умеет' },
-      h('li', {}, 'Скрытые карточки до показа'),
-      h('li', {}, 'Голосование точками'),
-      h('li', {}, 'Группировка и решения'),
-      h('li', {}, 'Экспорт в Markdown'),
+    h('span', { class: 'eyebrow' }, 'Ретроспективы для команды'),
+    h('h1', {}, 'Становимся ', h('br'), 'лучше.', h('em', {}, 'Вместе.')),
+    h('p', { class: 'lead' }, 'Говорим о том, что получилось. Находим, что изменить. Превращаем обратную связь в следующий шаг команды.'),
+    h('div', { class: 'hero-art', 'aria-hidden': 'true' },
+      h('img', { src: '/static/retro-shapes.svg', alt: '', width: 640, height: 280 }),
+      h('span', { class: 'art-caption' }, 'Разные взгляды. Общий результат.'),
     ),
   );
 
-  const page = h('div', { class: 'home-page' }, hero, form);
-  root.replaceChildren(page);
+  const steps = [
+    ['Запишите мысли', 'Каждый — в своём темпе'],
+    ['Откройте карточки', 'Посмотрите на спринт вместе'],
+    ['Выберите важное', 'Проголосуйте за главные темы'],
+    ['Договоритесь', 'Запишите решения и ответственных'],
+  ];
+  const page = h('main', { class: 'home-page' }, hero, form,
+    h('section', { class: 'how-it-works', id: 'how-it-works', 'aria-labelledby': 'steps-title' },
+      h('div', { class: 'section-heading' },
+        h('h2', { id: 'steps-title' }, 'От мыслей ', h('br'), 'к действиям'),
+        h('p', {}, 'Четыре шага, чтобы услышать друг друга и договориться о главном.')),
+      h('ol', { class: 'features', 'aria-label': 'Как проходит ретро' }, steps.map(([title, text], i) =>
+        h('li', {}, h('span', { class: 'feature-num', 'aria-hidden': 'true' }, `0${i + 1}`),
+          h('div', {}, h('strong', {}, title), h('p', {}, text)))))));
+  root.replaceChildren(
+    h('header', { class: 'home-header' },
+      h('div', { class: 'home-header-inner' },
+        h('div', { class: 'home-brand' }, brandLink()),
+        h('nav', { class: 'home-nav', 'aria-label': 'Главная' },
+          h('a', { href: '#how-it-works' }, 'Как проходит ретро'),
+          h('a', { href: '#new-board', class: 'header-cta' }, 'Новая доска',
+            h('span', { class: 'button-arrow', 'aria-hidden': 'true' }, '↗'))))),
+    page,
+    h('footer', { class: 'home-footer' },
+      h('span', {}, 'Меньше недосказанности.'), h('strong', {}, 'Больше команды.')),
+  );
 
   const recent = recentBoards();
   if (recent.length) {
@@ -274,6 +309,10 @@ function renderBoardPage(root, id) {
   const pendingCards = new Set();
   const pendingDone = new Map();
   const pendingVotes = new Map();
+  const jiraSelected = new Map();
+  const jiraChecking = new Set();
+  let jiraBusy = false;
+  let jiraNotice = '';
   let actionPending = false;
   const unsent = [];
   let composing = false;
@@ -317,7 +356,7 @@ function renderBoardPage(root, id) {
 
   root.replaceChildren(
     h('header', { class: 'topbar' },
-      h('div', { class: 'topbar-left' }, h('a', { href: '/', class: 'home' }, 'Ретро'), titleEl),
+      h('div', { class: 'topbar-left' }, brandLink('home'), titleEl),
       phaseNav,
       toolsEl,
     ),
@@ -921,13 +960,13 @@ function renderBoardPage(root, id) {
           }, 'Запустить')));
       }
     }
-    items.push(h('span', { class: 'tool' }, `Онлайн: ${online}`));
+    items.push(h('span', { class: 'tool online-count' }, `Онлайн: ${online}`));
     if (board.phase !== 'write') {
       items.push(h('a', {
         class: 'tool button', href: `/api/boards/${board.id}/export.md`, download: `retro-${board.id}.md`,
       }, 'Скачать .md'));
     }
-    items.push(h('button', { type: 'button', class: 'tool', onclick: copyLink }, 'Скопировать ссылку'));
+    items.push(h('button', { type: 'button', class: 'tool share-button', onclick: copyLink }, 'Скопировать ссылку'));
     if (board.isOwner && board.phase === 'discuss' && !board.nextId) {
       items.push(h('button', {
         type: 'button', class: 'tool', onclick: createNextBoard,
@@ -974,6 +1013,110 @@ function renderBoardPage(root, id) {
 
   // --- решения (action items) ---
 
+  function canSendJira(action) {
+    return board.jira && board.isOwner && board.phase === 'discuss' && !board.nextId
+      && editingActionId !== action.id
+      && !action.done && (!action.jira || action.jira.status === 'failed');
+  }
+
+  function jiraUnresolved(action) {
+    return ['pending', 'unknown'].includes(action.jira?.status);
+  }
+
+  // Сохраняем выбранные версии: пришедшая во время выбора правка требует
+  // нового выбора, иначе в Jira ушёл бы ещё не просмотренный ведущим текст.
+  function renderJiraTools() {
+    for (const [id, revision] of jiraSelected) {
+      const action = board.actions.find(a => a.id === id);
+      if (!action || !canSendJira(action) || action.revision !== revision) jiraSelected.delete(id);
+    }
+    if (!board.isOwner || board.phase !== 'discuss' || !board.actions.length) return null;
+    return h('div', { class: 'jira-tools' },
+      h('strong', {}, 'Задачи в Jira'),
+      h('p', { class: 'muted' }, board.nextId
+        ? 'Создавайте задачи из последнего ретро команды.'
+        : board.jira
+          ? `Проект ${board.jira.project}. Выберите решения для отправки. Имя ответственного попадёт в описание.`
+          : 'Jira пока не подключена. Попросите администратора настроить подключение на сервере Retro.'),
+      board.jira && !board.nextId ? h('button', {
+        type: 'button', class: 'primary small', disabled: jiraBusy || !jiraSelected.size,
+        onclick: createJiraSelected,
+      }, jiraBusy ? 'Создаём задачи…' : `Создать в Jira (${jiraSelected.size})`) : null,
+      jiraNotice ? h('p', { class: 'jira-notice', role: 'status' }, jiraNotice) : null);
+  }
+
+  async function createJiraSelected() {
+    if (jiraBusy || !jiraSelected.size) return;
+    const generation = pageGeneration;
+    const selected = [...jiraSelected];
+    jiraBusy = true;
+    jiraNotice = '';
+    render();
+    let created = 0;
+    try {
+      for (const [actionId, revision] of selected) {
+        if (!isCurrent(generation)) return;
+        const result = await mutate('POST', `/api/boards/${id}/actions/${actionId}/jira`, { revision });
+        const action = result.actions.find(a => a.id === actionId);
+        if (action?.jira?.status === 'created') { created++; jiraSelected.delete(actionId); }
+        jiraNotice = `Создано задач: ${created} из ${selected.length}.`;
+        render();
+      }
+      if (created < selected.length) jiraNotice += ' Проверьте сообщения у решений.';
+    } catch (err) {
+      if (!isCurrent(generation)) return;
+      jiraNotice = `Создано задач: ${created}. ${err.message} Остальные решения не отправлялись.`;
+      // При потере HTTP-ответа сохранённое состояние важнее локального флага.
+      try { await refreshBoard(); } catch { /* проверка/повтор доступны вручную */ }
+    } finally {
+      if (isCurrent(generation)) { jiraBusy = false; render(); }
+    }
+  }
+
+  async function checkJira(action) {
+    if (jiraChecking.has(action.id)) return;
+    const generation = pageGeneration;
+    jiraChecking.add(action.id);
+    render();
+    try {
+      await mutate('POST', `/api/boards/${id}/actions/${action.id}/jira/check`, {});
+      toast('Задача найдена, ссылка сохранена');
+    } catch (err) { reportError(err); }
+    finally { if (isCurrent(generation)) { jiraChecking.delete(action.id); render(); } }
+  }
+
+  function jiraLink(url, text) {
+    // Не доверяем ссылкам из импортированных/старых данных.
+    try {
+      const parsed = new URL(url);
+      if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+      return h('a', { href: parsed.href, target: '_blank', rel: 'noopener noreferrer' }, text);
+    } catch { return null; }
+  }
+
+  function renderActionJira(action) {
+    const link = action.jira;
+    return h('div', { class: 'action-jira' },
+      canSendJira(action) ? h('label', { class: 'jira-select' },
+        h('input', { type: 'checkbox', checked: jiraSelected.has(action.id), disabled: jiraBusy,
+          'aria-label': `Выбрать для Jira: ${action.text}`, dataset: { keep: `jira-select:${action.id}` },
+          onchange: e => {
+            if (e.target.checked) jiraSelected.set(action.id, action.revision);
+            else jiraSelected.delete(action.id);
+            render();
+          },
+        }), 'В Jira') : null,
+      link?.status === 'created' ? h('span', { class: 'jira-created' },
+        jiraLink(link.url, link.key), h('span', { class: 'muted' }, ' · изменения в Retro не меняют задачу')) : null,
+      link?.status === 'failed' ? h('p', { class: 'jira-error' }, link.error) : null,
+      jiraUnresolved(action) ? h('div', { class: 'jira-recovery' },
+        h('p', {}, link.error || 'Отправка в Jira ещё не подтверждена. Если ожидание затянулось, проверьте результат.'),
+        board.isOwner && board.jira ? h('button', { type: 'button', class: 'small',
+          disabled: jiraBusy || jiraChecking.has(action.id), onclick: () => checkJira(action),
+        }, jiraChecking.has(action.id) ? 'Проверяем…' : 'Проверить в Jira') : null,
+        jiraLink(link.searchUrl, 'Открыть поиск в Jira')) : null);
+  }
+
   // Панель решений появляется после фазы записи: пока карточки скрыты,
   // договариваться не о чем. Если решения уже есть, панель видна всегда.
   function renderActions() {
@@ -987,6 +1130,7 @@ function renderBoardPage(root, id) {
       h('header', { class: 'column-head' },
         h('h2', {}, 'Решения'),
         h('span', { class: 'count' }, board.actions.length ? `${done} из ${board.actions.length}` : '0')),
+      renderJiraTools(),
       empty,
       h('ul', { class: 'cards' }, board.actions.map(renderAction)),
       open ? renderActionComposer() : null,
@@ -995,7 +1139,7 @@ function renderBoardPage(root, id) {
 
   function renderAction(action) {
     if (editingActionId === action.id) return renderActionEditor(action);
-    const editable = action.mine || board.isOwner;
+    const editable = (action.mine || board.isOwner) && !jiraUnresolved(action);
     const done = pendingDone.get(action.id) ?? action.done;
     const checkbox = h('input', {
       type: 'checkbox', checked: done, disabled: !editable || pendingDone.has(action.id),
@@ -1019,7 +1163,8 @@ function renderBoardPage(root, id) {
         h('span', { class: 'meta' },
           h('span', { class: 'assignee' }, action.assignee || 'ответственный не назначен'),
           action.carried ? h('span', { class: 'carried', title: 'Перенесено из предыдущего ретро' }, 'перенесено') : null),
-        h('span', { class: 'card-actions' }, controls)));
+        h('span', { class: 'card-actions' }, controls)),
+      renderActionJira(action));
   }
 
   function renderActionComposer() {
@@ -1513,6 +1658,8 @@ function renderBoardPage(root, id) {
     pendingCards.clear();
     pendingDone.clear();
     pendingVotes.clear();
+    jiraBusy = false;
+    jiraChecking.clear();
     actionPending = false;
     pollInFlight = false;
     pollController = null;

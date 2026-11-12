@@ -33,6 +33,7 @@ before(async () => {
   origin = `http://127.0.0.1:${port}`;
   server = spawn(binary, ['-addr', `127.0.0.1:${port}`, '-data', path.join(directory, 'retro.db')], {
     cwd: root, stdio: ['ignore', 'pipe', 'pipe'],
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('JIRA_') && key !== 'RETRO_PUBLIC_URL')),
   });
   server.stdout.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16000); });
   server.stderr.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16000); });

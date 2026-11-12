@@ -12,11 +12,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"retro/internal/jira"
 )
 
 // Options — ограничения одного экземпляра. Идентификатор участника и
 // присланный клиентом X-Forwarded-For не служат ключами ограничения нагрузки.
 type Options struct {
+	Jira              *jira.Client
 	TrustedProxy      netip.Prefix
 	RequestsPerSecond float64
 	RequestBurst      int

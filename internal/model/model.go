@@ -103,12 +103,13 @@ type MutationReceipt struct {
 // Action — решение ретро (action item): что сделать и кто отвечает.
 // Появляются после фазы записи, когда карточки уже обсуждаются.
 type Action struct {
-	ID       string `json:"id"`
-	Revision uint64 `json:"revision"`
-	Text     string `json:"text"`
-	Assignee string `json:"assignee"` // ответственный; пустая строка — не назначен
-	AuthorID string `json:"authorId"` // кто записал решение
-	Done     bool   `json:"done"`
+	Jira     *JiraExport `json:"jira,omitempty"`
+	ID       string      `json:"id"`
+	Revision uint64      `json:"revision"`
+	Text     string      `json:"text"`
+	Assignee string      `json:"assignee"` // ответственный; пустая строка — не назначен
+	AuthorID string      `json:"authorId"` // кто записал решение
+	Done     bool        `json:"done"`
 	// CarriedFrom — id ретро, из которого решение перенесено незакрытым.
 	CarriedFrom string    `json:"carriedFrom,omitempty"`
 	CreatedAt   time.Time `json:"createdAt"`
@@ -215,6 +216,11 @@ func (prev *Board) NextBoard(title, actorID string) (*Board, error) {
 	if prev.NextID != "" {
 		return nil, fmt.Errorf("%w: у этого ретро уже есть следующее", ErrInvalid)
 	}
+	for _, a := range prev.Actions {
+		if a.JiraUnresolved() {
+			return nil, fmt.Errorf("%w: сначала проверьте результат отправки решений в Jira", ErrConflict)
+		}
+	}
 	if strings.TrimSpace(title) == "" {
 		title = prev.Title
 	}
@@ -237,6 +243,10 @@ func (prev *Board) NextBoard(title, actorID string) (*Board, error) {
 			CarriedFrom: prev.ID,
 			CreatedAt:   b.CreatedAt,
 		})
+		if a.Jira != nil && a.Jira.Status == "created" {
+			link := *a.Jira
+			b.Actions[len(b.Actions)-1].Jira = &link
+		}
 	}
 	return b, nil
 }
@@ -600,6 +610,9 @@ func cleanAssignee(assignee string) (string, error) {
 // Фаза не важна: решения уточняют и после ретро.
 func (b *Board) canEditAction(a *Action, actorID string) error {
 	if actorID == b.OwnerID || a.AuthorID == actorID {
+		if a.JiraUnresolved() {
+			return fmt.Errorf("%w: сначала проверьте результат отправки этого решения в Jira", ErrConflict)
+		}
 		return nil
 	}
 	return ErrForbidden
@@ -740,19 +753,20 @@ func (b *Board) SetVoteLimit(n int, actorID string) error {
 // BoardView — доска глазами конкретного участника: чужие карточки в фазе
 // записи скрыты, голоса видны только с фазы голосования.
 type BoardView struct {
-	ID          string       `json:"id"`
-	Revision    uint64       `json:"revision"`
-	Title       string       `json:"title"`
-	Phase       Phase        `json:"phase"`
-	VoteLimit   int          `json:"voteLimit"`
-	VotesLeft   int          `json:"votesLeft"`
-	IsOwner     bool         `json:"isOwner"`
-	TimerEndsAt *time.Time   `json:"timerEndsAt,omitempty"`
-	Columns     []ColumnView `json:"columns"`
-	Actions     []ActionView `json:"actions"`
-	PrevID      string       `json:"prevId,omitempty"`
-	NextID      string       `json:"nextId,omitempty"`
-	UpdatedAt   time.Time    `json:"updatedAt"`
+	Jira        *JiraConfigView `json:"jira,omitempty"`
+	ID          string          `json:"id"`
+	Revision    uint64          `json:"revision"`
+	Title       string          `json:"title"`
+	Phase       Phase           `json:"phase"`
+	VoteLimit   int             `json:"voteLimit"`
+	VotesLeft   int             `json:"votesLeft"`
+	IsOwner     bool            `json:"isOwner"`
+	TimerEndsAt *time.Time      `json:"timerEndsAt,omitempty"`
+	Columns     []ColumnView    `json:"columns"`
+	Actions     []ActionView    `json:"actions"`
+	PrevID      string          `json:"prevId,omitempty"`
+	NextID      string          `json:"nextId,omitempty"`
+	UpdatedAt   time.Time       `json:"updatedAt"`
 }
 
 // ColumnView — колонка в представлении участника.
@@ -781,13 +795,14 @@ type CardView struct {
 
 // ActionView — решение в представлении участника.
 type ActionView struct {
-	ID       string `json:"id"`
-	Revision uint64 `json:"revision"`
-	Text     string `json:"text"`
-	Assignee string `json:"assignee"`
-	Done     bool   `json:"done"`
-	Mine     bool   `json:"mine"`    // записано этим участником — можно править
-	Carried  bool   `json:"carried"` // перенесено из предыдущего ретро
+	Jira     *JiraView `json:"jira,omitempty"`
+	ID       string    `json:"id"`
+	Revision uint64    `json:"revision"`
+	Text     string    `json:"text"`
+	Assignee string    `json:"assignee"`
+	Done     bool      `json:"done"`
+	Mine     bool      `json:"mine"`    // записано этим участником — можно править
+	Carried  bool      `json:"carried"` // перенесено из предыдущего ретро
 }
 
 // View строит представление доски для участника viewer.
@@ -843,6 +858,12 @@ func (b *Board) View(viewer string) BoardView {
 			ID: a.ID, Revision: a.Revision, Text: a.Text, Assignee: a.Assignee, Done: a.Done,
 			Mine: a.AuthorID == viewer, Carried: a.CarriedFrom != "",
 		})
+		if a.Jira != nil {
+			v.Actions[len(v.Actions)-1].Jira = &JiraView{
+				Status: a.Jira.Status, Key: a.Jira.Key, URL: a.Jira.URL,
+				SearchURL: a.Jira.SearchURL, Error: a.Jira.Error,
+			}
+		}
 	}
 	return v
 }
