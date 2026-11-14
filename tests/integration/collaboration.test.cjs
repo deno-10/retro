@@ -34,7 +34,7 @@ before(async () => {
   origin = `http://127.0.0.1:${port}`;
   server = spawn(binary, ['-addr', `127.0.0.1:${port}`, '-data', path.join(directory, 'retro.db')], {
     cwd: root, stdio: ['ignore', 'pipe', 'pipe'],
-    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('JIRA_') && key !== 'RETRO_PUBLIC_URL')),
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('JIRA_') && !key.startsWith('RETRO_OLLAMA_') && key !== 'RETRO_PUBLIC_URL')),
   });
   server.stdout.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16000); });
   server.stderr.on('data', chunk => { serverLog = (serverLog + chunk).slice(-16000); });
@@ -223,6 +223,126 @@ test('Готовность: повтор этапа сбрасывает отм�
   assert.equal(current.phase, 'write');
   assert.equal(current.writing.ready, 0);
   assert.equal(current.writing.round, 2);
+});
+
+test('Умная группировка после записи: ведущий исправляет предложения, команда видит только подтверждённые группы', async t => {
+  const [owner, member] = await Promise.all([openGuest(origin), openGuest(origin)]);
+  const { data: board } = await api('POST', '/api/boards', owner, { title: 'Группировка после записи' });
+  const path = '/api/boards/' + board.id;
+  await admit(board.id, owner, member);
+  const firstCol = board.columns[0].id;
+  const secondCol = board.columns[1].id;
+  for (const [col, text] of [
+    [firstCol, 'Слишком долгие созвоны'], [firstCol, 'Долгие встречи'], [firstCol, 'Долгие созвоны по пятницам'],
+    [firstCol, 'Больше времени на обсуждение'], [firstCol, 'Полезная документация'],
+    [secondCol, 'Долгие встречи'], [secondCol, 'Долгие созвоны'],
+  ]) {
+    assert.equal((await api('POST', path + '/cards', member, { columnId: col, text })).status, 200);
+  }
+  const leader = await writingPage(t, board.id, owner, false);
+  const colleague = await writingPage(t, board.id, member, false);
+  const panel = page => page.getByRole('region', { name: 'Предложения групп' });
+  assert.equal(await panel(leader).count(), 0);
+  assert.equal(await leader.getByText('Слишком долгие созвоны', { exact: true }).count(), 0);
+  await leader.getByText('Готовы: 0 из 2', { exact: true }).waitFor();
+  await colleague.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  await leader.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  const review = panel(leader);
+  const apply = review.getByRole('button', { name: 'Подтвердить группы' });
+  await apply.waitFor();
+  await colleague.getByText('Слишком долгие созвоны', { exact: true }).waitFor();
+  assert.equal(await panel(colleague).count(), 0);
+  const column = review.getByRole('group', { name: board.columns[0].title, exact: true });
+  const choice = text => column.getByRole('combobox', { name: text, exact: true });
+  assert.equal(await choice('Долгие встречи').inputValue(), '1');
+  assert.equal(await choice('Полезная документация').inputValue(), '0');
+
+  await choice('Долгие встречи').selectOption('0');
+  await review.getByRole('button', { name: 'Оставить как есть' }).click();
+  assert.equal(await colleague.locator('li.group').count(), 0);
+  await review.getByRole('button', { name: 'Обновить предложения' }).click();
+  assert.equal(await choice('Долгие встречи').inputValue(), '1');
+  assert.equal((await api('POST', path + '/cards', member, {
+    columnId: firstCol, text: 'Пересмотреть расписание',
+  })).status, 200);
+  await review.getByText('Доска изменилась.', { exact: false }).waitFor();
+  assert.equal(await apply.count(), 0);
+  await review.getByRole('button', { name: 'Обновить предложения' }).click();
+  await choice('Долгие встречи').selectOption('new');
+  await choice('Больше времени на обсуждение').selectOption({ label: 'Группа 2' });
+  await choice('Пересмотреть расписание').selectOption({ label: 'Группа 1' });
+  await choice('Долгие созвоны по пятницам').selectOption('0');
+  assert.equal(await colleague.locator('li.group').count(), 0);
+  await apply.click();
+  await colleague.waitForFunction(() => document.querySelectorAll('li.group').length === 3);
+  const result = (await api('GET', path, member)).data.columns;
+  const groupOf = (col, text) => col.cards.find(card => card.text === text).groupId;
+  const a = groupOf(result[0], 'Слишком долгие созвоны');
+  const b = groupOf(result[0], 'Долгие встречи');
+  assert.ok(a && b && a !== b);
+  assert.equal(groupOf(result[0], 'Пересмотреть расписание'), a);
+  assert.equal(groupOf(result[0], 'Больше времени на обсуждение'), b);
+  assert.equal(groupOf(result[0], 'Долгие созвоны по пятницам'), undefined);
+  assert.equal(groupOf(result[0], 'Полезная документация'), undefined);
+  const c = result[1].cards[0].groupId;
+  assert.ok(c && c !== a && c !== b);
+  assert.equal(result[1].cards[1].groupId, c);
+  await leader.reload();
+  await panel(leader).getByText('Подходящих групп нет.', { exact: false }).waitFor();
+  assert.equal(await leader.locator('li.group').count(), 3);
+});
+
+test('Черновик Qwen: ошибка не теряет правки, повтор показывает источник, подтверждается только просмотренный состав', async t => {
+  const owner = await openGuest(origin);
+  const { data: board } = await api('POST', '/api/boards', owner, { title: 'Проба локальной модели' });
+  const path = '/api/boards/' + board.id;
+  const columnId = board.columns[0].id;
+  const texts = ['Долгие встречи', 'Долгие созвоны', 'Не дошли до повестки'];
+  let cards;
+  for (const text of texts) {
+    const result = await api('POST', path + '/cards', owner, { columnId, text });
+    assert.equal(result.status, 200);
+    cards = result.data.columns[0].cards;
+  }
+  const page = await writingPage(t, board.id, owner, false);
+  const review = page.getByRole('region', { name: 'Предложения групп' });
+  await page.route(origin + path + '/group-suggestions', async route => {
+    const rules = await (await route.fetch()).json();
+    await route.fulfill({ json: { ...rules, model: 'qwen3:4b' } });
+  });
+  let calls = 0;
+  await page.route(origin + path + '/group-suggestions/qwen', async route => {
+    calls++;
+    const { revision } = route.request().postDataJSON();
+    if (calls === 1) return route.fulfill({ status: 503, json: { error: 'Модель недоступна' } });
+    return route.fulfill({ json: { revision, source: 'qwen', model: 'qwen3:4b',
+      columns: [{ columnId, groups: [cards.map(c => c.id)] }] } });
+  });
+  await page.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  const useModel = review.getByRole('button', { name: 'Предложить с Qwen' });
+  const choice = i => review.getByRole('combobox', { name: texts[i], exact: true });
+  await choice(1).selectOption('0');
+  assert.equal(calls, 0);
+  page.once('dialog', dialog => dialog.dismiss());
+  await useModel.click();
+  assert.equal(calls, 0);
+  page.once('dialog', dialog => dialog.accept());
+  await useModel.click();
+  await review.getByText('Модель недоступна').waitFor();
+  assert.equal(await choice(1).inputValue(), '0');
+  page.once('dialog', dialog => dialog.accept());
+  await useModel.click();
+  await review.getByText('Предложила локальная модель qwen3:4b.').waitFor();
+  assert.equal(await choice(2).inputValue(), '1');
+  const read = async () => (await api('GET', path, owner)).data.columns[0].cards;
+  assert.ok((await read()).every(c => !c.groupId));
+  await choice(0).selectOption('0');
+  await review.getByRole('button', { name: 'Подтвердить группы' }).click();
+  await page.locator('li.group').waitFor();
+  const saved = await read();
+  assert.ok(!saved.find(c => c.text === texts[0]).groupId);
+  const group = saved.find(c => c.text === texts[1]).groupId;
+  assert.ok(group && saved.find(c => c.text === texts[2]).groupId === group);
 });
 
 async function fixture() {

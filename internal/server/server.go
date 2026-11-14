@@ -33,6 +33,7 @@ type Server struct {
 	traffic   *trafficGuard
 	stats     *metrics
 	jiraSlots chan struct{}
+	modelSlot chan struct{}
 
 	// timers — запланированные срабатывания таймеров фаз по id доски.
 	// Планировщик живёт в памяти процесса; syncTimer восстанавливает его
@@ -76,6 +77,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	s.traffic = newTrafficGuard(s.options)
 	s.stats = &metrics{started: time.Now()}
 	s.jiraSlots = make(chan struct{}, 4)
+	s.modelSlot = make(chan struct{}, 1)
 
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", s.handleHealth)
@@ -101,6 +103,9 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	m.HandleFunc("POST /api/boards/{id}/cards/{cardId}/vote", s.handleVote)
 	m.HandleFunc("POST /api/boards/{id}/cards/{cardId}/group", s.handleGroupCard)
 	m.HandleFunc("DELETE /api/boards/{id}/cards/{cardId}/group", s.handleUngroupCard)
+	m.HandleFunc("GET /api/boards/{id}/group-suggestions", s.handleGroupSuggestions)
+	m.HandleFunc("POST /api/boards/{id}/group-suggestions/qwen", s.handleModelSuggestions)
+	m.HandleFunc("POST /api/boards/{id}/groups", s.handleApplyGroups)
 	m.HandleFunc("POST /api/boards/{id}/actions", s.handleAddAction)
 	m.HandleFunc("POST /api/boards/{id}/actions/{actionId}/jira", s.handleCreateJira)
 	m.HandleFunc("POST /api/boards/{id}/actions/{actionId}/jira/check", s.handleCheckJira)
@@ -574,6 +579,39 @@ func (s *Server) handleUngroupCard(w http.ResponseWriter, r *http.Request) {
 	cardID := r.PathValue("cardId")
 	s.mutate(w, r, func(b *model.Board, pid string) error {
 		return b.UngroupCard(cardID, pid)
+	})
+}
+
+func (s *Server) handleGroupSuggestions(w http.ResponseWriter, r *http.Request) {
+	pid := participant(r)
+	b, err := s.currentBoard(r.PathValue("id"), pid)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	columns, err := b.SuggestGroups(pid)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.writeSuggestion(w, b.Revision, columns, "rules")
+}
+
+func (s *Server) handleApplyGroups(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Revision *uint64              `json:"revision"`
+		Columns  []model.ColumnGroups `json:"columns"`
+	}
+	if err := decode(w, r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if in.Revision == nil {
+		s.writeErr(w, fmt.Errorf("%w: требуется версия предложений", model.ErrInvalid))
+		return
+	}
+	s.mutate(w, r, func(b *model.Board, pid string) error {
+		return b.ApplyGroups(pid, *in.Revision, in.Columns)
 	})
 }
 

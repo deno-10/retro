@@ -292,6 +292,21 @@ a.history-title:hover { color: var(--brand); }
 .composer-row input { flex: 1; min-width: 0; padding: 8px 10px; font-size: 13px; }
 
 /* Группировка */
+.group-review { margin: 20px 28px 0; padding: 18px 22px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); }
+.group-review h2 { font-size: 18px; }
+.group-review p { margin: 6px 0 10px; font-size: 14px; }
+.group-review-column { min-width: 0; margin: 12px 0; padding: 4px 14px; border: 1px solid var(--line); border-radius: 12px; }
+.group-review-column legend { padding: 0 5px; font-size: 14px; font-weight: 800; }
+.group-review-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 6px 0; font-size: 14px; }
+.group-review-card span { white-space: pre-wrap; overflow-wrap: anywhere; }
+.group-review-card + .group-review-card { border-top: 1px solid var(--line); }
+.group-review-card select { max-width: 100%; padding: 6px 10px; }
+.group-review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+@media (max-width: 600px) {
+  .group-review { margin: 16px 16px 0; padding: 16px; }
+  .group-review-card { grid-template-columns: 1fr; gap: 4px; }
+  .group-review-card select { justify-self: start; }
+}
 .group { border: 1px dashed color-mix(in srgb, var(--col) 65%, black); border-radius: var(--radius); padding: 10px; display: grid; gap: 10px; background: color-mix(in srgb, var(--col) 9%, white); }
 .group .cards { gap: 8px; }
 .group .card { box-shadow: none; }

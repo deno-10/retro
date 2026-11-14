@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"net/netip"
-	"retro/internal/server"
 	"strconv"
+
+	"retro/internal/ollama"
+	"retro/internal/server"
 )
 
 type runtimeConfig struct {
@@ -32,6 +34,11 @@ func configFromEnv(get func(string) string) (runtimeConfig, error) {
 		}
 	}
 	c.DatabaseURL = get("RETRO_DATABASE_URL")
+	localModel, err := ollama.New(get("RETRO_OLLAMA_MODEL"), get("RETRO_OLLAMA_ADDR"))
+	if err != nil {
+		return c, err
+	}
+	c.Options.Ollama = localModel
 	if proxy := get("RETRO_TRUSTED_PROXY"); proxy != "" {
 		p, err := netip.ParsePrefix(proxy)
 		if err != nil {

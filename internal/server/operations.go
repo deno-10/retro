@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"retro/internal/jira"
+	"retro/internal/ollama"
 )
 
 // Options — ограничения одного экземпляра. Идентификатор участника и
@@ -26,6 +27,7 @@ type Options struct {
 	BasePath          string // внешний префикс; шлюз удаляет его перед проксированием
 	SharedStore       bool
 	Jira              *jira.Client
+	Ollama            *ollama.Client
 	TrustedProxy      netip.Prefix
 	RequestsPerSecond float64
 	RequestBurst      int

@@ -80,7 +80,8 @@ async function api(method, path, body, options = {}) {
   const forwardAbort = () => controller.abort();
   options.signal?.addEventListener('abort', forwardAbort, { once: true });
   if (options.signal?.aborted) controller.abort();
-  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
+  const timeoutMs = options.timeoutMs || 15000;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
   try {
     const request = (async () => {
       const res = await fetch(appPath(path), {
@@ -109,7 +110,7 @@ async function api(method, path, body, options = {}) {
   } catch (err) {
     if (err.status) throw err;
     const failure = new Error(timedOut
-      ? 'Сервер не ответил за 15 секунд. Результат запроса не подтверждён.'
+      ? `Сервер не ответил за ${timeoutMs / 1000} секунд. Результат запроса не подтверждён.`
       : 'Не удалось получить ответ сервера. Проверьте соединение.');
     failure.unknownOutcome = method !== 'GET';
     failure.timeout = timedOut;
@@ -329,6 +330,7 @@ function renderBoardPage(root, id) {
   const pendingVotes = new Map();
   const jiraSelected = new Map();
   const jiraChecking = new Set();
+  let groupReview = null;
   let jiraBusy = false;
   let jiraNotice = '';
   let actionPending = false;
@@ -365,6 +367,7 @@ function renderBoardPage(root, id) {
   const timerEl = h('span', { class: 'timer', role: 'timer', hidden: true });
   const statusEl = h('span', { class: 'status', hidden: true });
   const writingEl = h('section', { class: 'writing-ready', 'aria-label': 'Готовность участников', hidden: true });
+  const groupReviewEl = h('section', { class: 'group-review', 'aria-label': 'Предложения групп', hidden: true });
   const columnsEl = h('main', { class: 'columns' });
   const recoveryEl = h('section', { 'aria-label': 'Неотправленные записи' });
   const draftWarningEl = h('div', { class: 'draft-warning', role: 'alert', hidden: true });
@@ -385,6 +388,7 @@ function renderBoardPage(root, id) {
     ),
     h('div', { class: 'statusline' }, hintEl, timerEl, statusEl, chainEl),
     writingEl,
+    groupReviewEl,
     draftWarningEl,
     recoveryEl,
     columnsEl,
@@ -594,6 +598,7 @@ function renderBoardPage(root, id) {
     root.hidden = false;
     render();
     ensureWritingJoined();
+    if (!groupReview && board.isOwner && board.phase === 'reveal') loadGroupReview();
     return true;
   }
 
@@ -941,6 +946,7 @@ function renderBoardPage(root, id) {
     renderWritingReady();
     renderTimer();
     renderColumns();
+    renderGroupReview();
     columnsEl.scrollLeft = scrollLeft;
     restoreFocus(saved);
     persistDrafts();
@@ -1538,6 +1544,163 @@ function renderBoardPage(root, id) {
 
   // --- группы и перетаскивание ---
 
+  async function loadGroupReview(source = 'rules') {
+    if (disposed || !board.isOwner || board.phase !== 'reveal') return;
+    const previous = groupReview;
+    if (previous?.dirty && !previous.closed && previous.revision === board.revision &&
+        !confirm('Заменить ваши правки новыми предложениями?')) return;
+    const review = { source, model: previous?.model, loading: true, assignments: new Map(), error: '', applying: false, closed: false };
+    groupReview = review;
+    renderGroupReview();
+    try {
+      const path = `/api/boards/${id}/group-suggestions`;
+      const proposal = source === 'qwen'
+        ? await boardRequest('POST', path + '/qwen', { revision: board.revision }, { timeoutMs: 100000 })
+        : await boardRequest('GET', path);
+      // Если чтение предложений обогнало SSE, нужны и тексты той же версии.
+      if (groupReview !== review) return;
+      if (proposal.revision > board.revision) await refreshBoard();
+      if (groupReview !== review) return;
+      review.revision = proposal.revision;
+      review.model = proposal.model;
+      for (const col of board.columns) {
+        const suggested = proposal.columns.find(column => column.columnId === col.id);
+        if (!suggested) continue;
+        const picks = new Map(col.cards.filter(card => !card.groupId).map(card => [card.id, 0]));
+        for (const [i, group] of suggested.groups.entries()) {
+          for (const cardId of group) {
+            if (picks.has(cardId)) picks.set(cardId, i + 1);
+          }
+        }
+        review.assignments.set(col.id, picks);
+      }
+    } catch (err) {
+      if (err.inactive || groupReview !== review) return;
+      if (previous && previous.revision === board.revision && !previous.closed) {
+        // При недоступной модели оставляем видимым прежний черновик со всеми правками.
+        groupReview = previous;
+        previous.error = err.message;
+        renderGroupReview();
+        return;
+      }
+      review.error = 'Не удалось получить предложения. ' + err.message;
+    } finally {
+      if (groupReview === review && !disposed) {
+        review.loading = false;
+        renderGroupReview();
+      }
+    }
+  }
+
+  // Ноль означает «Без группы». Одиночная карточка при подтверждении
+  // остаётся отдельно, даже если ведущий вынул из группы её соседей.
+  function selectedGroups() {
+    const columns = [];
+    for (const [columnId, picks] of groupReview.assignments) {
+      const byNumber = new Map();
+      for (const [cardId, number] of picks) {
+        if (!number) continue;
+        if (!byNumber.has(number)) byNumber.set(number, []);
+        byNumber.get(number).push(cardId);
+      }
+      const groups = [...byNumber.values()].filter(cards => cards.length >= 2);
+      if (groups.length) columns.push({ columnId, groups });
+    }
+    return columns;
+  }
+
+  async function confirmGroupReview() {
+    const review = groupReview;
+    if (!review || review.applying || review.revision !== board.revision) return;
+    const columns = selectedGroups();
+    if (!columns.length) return;
+    review.applying = true;
+    review.error = '';
+    renderGroupReview();
+    try {
+      await mutate('POST', `/api/boards/${id}/groups`, { revision: review.revision, columns });
+      if (groupReview === review) review.closed = true;
+      toast('Группы сохранены');
+    } catch (err) {
+      if (err.inactive || groupReview !== review) return;
+      review.error = err.message;
+      // При потере ответа группы уже могли сохраниться. Новое чтение
+      // показывает результат; устаревшая версия повторно ничего не изменит.
+      if (err.status === 409 || err.unknownOutcome) await refreshBoard().catch(() => {});
+    } finally {
+      if (groupReview === review && !disposed) {
+        review.applying = false;
+        renderGroupReview();
+      }
+    }
+  }
+
+  function renderGroupReview() {
+    if (!board.isOwner || board.phase !== 'reveal') {
+      groupReview = null;
+      groupReviewEl.replaceChildren();
+    }
+    const review = groupReview;
+    groupReviewEl.hidden = !review;
+    if (!review) return;
+    const title = h('h2', {}, 'Предложения групп');
+    const refresh = h('button', { type: 'button', class: 'small', onclick: () => loadGroupReview(review.source) }, 'Обновить предложения');
+    const comparison = !review.model ? [] : [h('button', { type: 'button', class: 'small', disabled: review.applying,
+      onclick: () => loadGroupReview(review.source === 'qwen' ? 'rules' : 'qwen'),
+    }, review.source === 'qwen' ? 'Посмотреть по словарю' : 'Предложить с Qwen')];
+    const origin = !review.model ? [] : [h('p', { class: 'muted' },
+      review.source === 'qwen' ? 'Предложила локальная модель ' + review.model + '.' : 'Предложения по словарю.')];
+    const message = text => h('p', { class: 'muted', role: 'status' }, text);
+    if (review.loading) {
+      groupReviewEl.replaceChildren(title, message(review.source === 'qwen' ? 'Qwen сравнивает карточки на этом компьютере…' : 'Ищем похожие карточки…'));
+      return;
+    }
+    const stale = review.revision !== board.revision;
+    if (review.closed || (stale && !review.applying)) {
+      groupReviewEl.replaceChildren(title,
+        ...(review.closed ? [] : [message(review.error || 'Доска изменилась. Обновите предложения перед подтверждением.')]), refresh, ...comparison);
+      return;
+    }
+    const columns = [];
+    for (const col of board.columns) {
+      const picks = review.assignments.get(col.id);
+      if (!picks?.size) continue;
+      const numbers = [...new Set(picks.values())].filter(Boolean).sort((a, b) => a - b);
+      columns.push(h('fieldset', { class: 'group-review-column' }, h('legend', {}, col.title),
+        col.cards.filter(card => picks.has(card.id)).map(card => {
+          const select = h('select', {
+            disabled: review.applying,
+            onchange: e => {
+              const value = e.target.value;
+              picks.set(card.id, value === 'new' ? (numbers.at(-1) || 0) + 1 : Number(value));
+              review.dirty = true;
+              renderGroupReview();
+              groupReviewEl.querySelector(`[data-card="${CSS.escape(card.id)}"]`)?.focus({ preventScroll: true });
+            },
+            dataset: { card: card.id },
+          }, h('option', { value: '0' }, 'Без группы'),
+          numbers.map(n => h('option', { value: String(n) }, 'Группа ' + n)),
+          h('option', { value: 'new' }, 'Новая группа'));
+          select.value = String(picks.get(card.id));
+          return h('label', { class: 'group-review-card' }, h('span', {}, card.text), select);
+        })));
+    }
+    if (!columns.length) {
+      groupReviewEl.replaceChildren(title, ...origin, message('Подходящих групп нет. Карточки можно объединить вручную на доске.'),
+        ...(review.error ? [message(review.error)] : []), refresh, ...comparison);
+      return;
+    }
+    const apply = h('button', { type: 'button', class: 'primary small',
+      disabled: review.applying || !selectedGroups().length, onclick: confirmGroupReview,
+    }, review.applying ? 'Сохраняем…' : 'Подтвердить группы');
+    const dismiss = h('button', { type: 'button', class: 'small', disabled: review.applying,
+      onclick: () => { review.closed = true; renderGroupReview(); },
+    }, 'Оставить как есть');
+    groupReviewEl.replaceChildren(title, ...origin, h('p', { class: 'muted' },
+      'Проверьте состав групп. Карточка без пары останется отдельно.'), ...columns,
+      ...(review.error ? [message(review.error)] : []), h('div', { class: 'group-review-actions' }, apply, ...comparison, dismiss));
+  }
+
   // Группирует только ведущий, и только когда карточки видны всем.
   function canGroup() {
     return board.isOwner && board.phase !== 'write';
@@ -1819,6 +1982,9 @@ function renderBoardPage(root, id) {
     joinFailedRound = null;
     writingNotice = '';
     jiraChecking.clear();
+    groupReview = null;
+    groupReviewEl.hidden = true;
+    groupReviewEl.replaceChildren();
     actionPending = false;
     pollInFlight = false;
     pollController = null;

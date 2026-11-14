@@ -25,12 +25,17 @@ func newTestServer(t *testing.T) http.Handler {
 
 func newTestServerWithStore(t *testing.T) (http.Handler, store.Store) {
 	t.Helper()
+	return newTestServerWithStoreOptions(t, testOptions())
+}
+
+func newTestServerWithStoreOptions(t *testing.T, opts Options) (http.Handler, store.Store) {
+	t.Helper()
 	st, err := store.OpenJSON(filepath.Join(t.TempDir(), "boards.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
-	return New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil)), testOptions()), st
+	return New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil)), opts), st
 }
 
 func do(t *testing.T, h http.Handler, method, path, participant string, body any) (*httptest.ResponseRecorder, map[string]any) {
