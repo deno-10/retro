@@ -157,15 +157,13 @@ func (s *SQLiteStore) CreateNext(prevID, title, actorID string) (*model.Board, e
 // Get возвращает копию доски: объект собран из JSON только что и ни с кем
 // не разделяется, менять его снаружи безопасно.
 func (s *SQLiteStore) Get(id string) (*model.Board, error) {
-	var data string
-	err := s.db.QueryRow(`SELECT data FROM boards WHERE id = ?`, id).Scan(&data)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, model.ErrNotFound
-	case err != nil:
-		return nil, err
-	}
-	return decodeBoard(data)
+	return scanBoard(s.db.QueryRow(`SELECT data FROM boards WHERE id = ?`, id))
+}
+
+func (s *SQLiteStore) GetForMember(id, participant string) (*model.Board, error) {
+	return scanBoard(s.db.QueryRow(`SELECT data FROM boards WHERE id = ?1 AND ?2 <> ''
+		AND (json_extract(data, '$.ownerId') = ?2
+		OR EXISTS (SELECT 1 FROM json_each(boards.data, '$.members') WHERE key = ?2))`, id, participant))
 }
 
 // Update читает доску в транзакции, применяет fn и записывает результат.
@@ -199,8 +197,12 @@ func (s *SQLiteStore) Update(id string, fn func(b *model.Board) error) (*model.B
 }
 
 func readBoard(tx *sql.Tx, id string) (*model.Board, error) {
+	return scanBoard(tx.QueryRow(`SELECT data FROM boards WHERE id = ?`, id))
+}
+
+func scanBoard(row *sql.Row) (*model.Board, error) {
 	var data string
-	err := tx.QueryRow(`SELECT data FROM boards WHERE id = ?`, id).Scan(&data)
+	err := row.Scan(&data)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, model.ErrNotFound

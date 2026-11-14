@@ -42,6 +42,7 @@ func newMutationFixture(t *testing.T, backend string) *mutationFixture {
 	requireMutationStatus(t, rec, http.StatusCreated)
 	f.id = view["id"].(string)
 	f.column = view["columns"].([]any)[0].(map[string]any)["id"].(string)
+	admitMembers(t, f.handler, f.id, mutationOwner, mutationAuthor)
 	f.phase("reveal")
 	return f
 }

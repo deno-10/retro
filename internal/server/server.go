@@ -85,6 +85,7 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	m.HandleFunc("GET /api/templates", s.handleTemplates)
 	m.HandleFunc("POST /api/boards", s.handleCreateBoard)
 	m.HandleFunc("GET /api/boards/{id}", s.handleGetBoard)
+	m.HandleFunc("POST /api/boards/{id}/members", s.handleAddMember)
 	m.HandleFunc("GET /api/boards/{id}/events", s.handleEvents)
 	m.HandleFunc("GET /api/boards/{id}/export.md", s.handleExport)
 	m.HandleFunc("POST /api/boards/{id}/phase", s.handleSetPhase)
@@ -181,6 +182,9 @@ func (s *Server) updateBoard(r *http.Request, fn func(b *model.Board, pid string
 	id := r.PathValue("id")
 	var operationErr error
 	b, err := s.store.Update(id, func(bd *model.Board) error {
+		if !bd.HasMember(pid) {
+			return model.ErrNotFound
+		}
 		// Дедлайн проверяется после получения блокировки/транзакции Store,
 		// чтобы ожидавший записи запрос не воспользовался уже истёкшей фазой.
 		if !bd.ExpireTimer(time.Now()) {
@@ -204,7 +208,7 @@ func (s *Server) updateBoard(r *http.Request, fn func(b *model.Board, pid string
 	})
 	replayed := errors.Is(err, errMutationReplayed)
 	if replayed {
-		b, err = s.store.Get(id)
+		b, err = s.store.GetForMember(id, pid)
 	}
 	if err != nil {
 		return nil, pid, err
@@ -213,6 +217,9 @@ func (s *Server) updateBoard(r *http.Request, fn func(b *model.Board, pid string
 		s.hub.Notify(id)
 	}
 	b = s.syncTimer(b)
+	if !b.HasMember(pid) {
+		return nil, pid, model.ErrNotFound
+	}
 	if operationErr != nil && !errors.Is(operationErr, errMutationReplayed) {
 		return nil, pid, operationErr
 	}
@@ -424,13 +431,42 @@ func (s *Server) handleCreateBoard(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetBoard(w http.ResponseWriter, r *http.Request) {
 	pid := participant(r)
-	b, err := s.store.Get(r.PathValue("id"))
+	b, err := s.currentBoard(r.PathValue("id"), pid)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	b = s.syncTimer(b) // после рестарта здесь таймер встаёт на место
 	writeJSON(w, http.StatusOK, s.view(b, pid))
+}
+
+// Планировщик может вернуть более свежий снимок, в том числе после смены ведущего.
+func (s *Server) currentBoard(id, pid string) (*model.Board, error) {
+	b, err := s.store.GetForMember(id, pid)
+	if err != nil {
+		return nil, err
+	}
+	b = s.syncTimer(b)
+	if !b.HasMember(pid) {
+		return nil, model.ErrNotFound
+	}
+	return b, nil
+}
+
+func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ParticipantID string `json:"participantId"`
+	}
+	if err := decode(w, r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.mutate(w, r, func(b *model.Board, pid string) error {
+		added, err := b.AddMember(in.ParticipantID, pid)
+		if err == nil && !added {
+			return errMutationReplayed
+		}
+		return err
+	})
 }
 
 func (s *Server) handleAddCard(w http.ResponseWriter, r *http.Request) {
@@ -614,6 +650,10 @@ func (s *Server) handleNextBoard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prevID := r.PathValue("id")
+	if _, err := s.store.GetForMember(prevID, pid); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	next, err := s.store.CreateNext(prevID, in.Title, pid)
 	if err != nil {
 		s.writeErr(w, err)
@@ -638,7 +678,8 @@ type historyItem struct {
 // последнему. Длина ограничена, чтобы повреждённые ссылки не зациклили обход.
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	cur, err := s.store.Get(id)
+	pid := participant(r)
+	cur, err := s.store.GetForMember(id, pid)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -655,7 +696,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	var back []historyItem
 	for b, n := cur, 0; b.PrevID != "" && n < limit; n++ {
-		p, err := s.store.Get(b.PrevID)
+		p, err := s.store.GetForMember(b.PrevID, pid)
 		if err != nil {
 			break
 		}
@@ -668,7 +709,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	chain = append(chain, item(cur))
 	for b, n := cur, 0; b.NextID != "" && n < limit; n++ {
-		nx, err := s.store.Get(b.NextID)
+		nx, err := s.store.GetForMember(b.NextID, pid)
 		if err != nil {
 			break
 		}
@@ -708,16 +749,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	pid := participant(r)
 	id := r.PathValue("id")
+	if _, err := s.store.GetForMember(id, pid); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	release, ok := s.traffic.acquireStream(s.traffic.clientIP(r), id)
 	if !ok {
 		rejectBusy(w)
 		return
 	}
 	defer release()
-	if _, err := s.store.Get(id); err != nil {
-		s.writeErr(w, err)
-		return
-	}
 	_, ok = w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -725,7 +766,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("X-Accel-Buffering", "no") // nginx: не буферизовать поток
 	controller := http.NewResponseController(w)
 	writeEvent := func(data string) bool {
@@ -754,11 +795,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	var sentRevision uint64
 	var sent bool
 	send := func(changedOnly bool) bool {
-		b, err := s.store.Get(id)
+		b, err := s.currentBoard(id, pid)
 		if err != nil {
 			return false
 		}
-		b = s.syncTimer(b)
 		if changedOnly && sent && sentRevision == b.Revision {
 			return true
 		}
@@ -813,7 +853,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
-	b, err := s.store.Get(r.PathValue("id"))
+	b, err := s.store.GetForMember(r.PathValue("id"), participant(r))
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -828,17 +868,34 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	status := http.StatusOK
+	if id := r.PathValue("id"); id != "" {
+		if _, err := s.store.GetForMember(id, participant(r)); err != nil {
+			if !errors.Is(err, model.ErrNotFound) {
+				s.writeErr(w, err)
+				return
+			}
+			status = http.StatusNotFound
+		}
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "private, no-cache")
+	// Оболочка без содержимого доски поддерживает возврат к черновикам через BFCache.
+	// Снимки API всегда отдаются с no-store и проверяются при возврате на страницу.
+	if status == http.StatusOK && s.options.AuthMode != "baas" {
+		w.Header().Set("Cache-Control", "private, no-cache")
+	}
 	index := string(s.index)
 	prefix := s.options.BasePath
 	index = strings.ReplaceAll(index, `="/static/`, `="`+prefix+`/static/`)
 	meta := `<meta name="retro-base-path" content="` + html.EscapeString(prefix) + `">`
 	meta += `<meta name="retro-participant" content="` + html.EscapeString(participant(r)) + `">`
 	if s.options.AuthMode == "baas" {
-		w.Header().Set("Cache-Control", "private, no-store")
 		meta += `<meta name="retro-auth" content="baas">`
 	}
+	if status == http.StatusNotFound {
+		meta += `<meta name="retro-board-unavailable" content="true">`
+	}
 	index = strings.Replace(index, "</head>", meta+"\n</head>", 1)
+	w.WriteHeader(status)
 	_, _ = io.WriteString(w, index)
 }

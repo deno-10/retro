@@ -77,8 +77,8 @@ type pausedTimerReadStore struct {
 	resume   chan struct{}
 }
 
-func (s *pausedTimerReadStore) Get(id string) (*model.Board, error) {
-	b, err := s.Store.Get(id)
+func (s *pausedTimerReadStore) GetForMember(id, pid string) (*model.Board, error) {
+	b, err := s.Store.GetForMember(id, pid)
 	if s.paused.CompareAndSwap(false, true) {
 		close(s.captured)
 		<-s.resume
@@ -97,7 +97,7 @@ func TestTimerGETSnapshotBeforePOSTDoesNotCancelTimer(t *testing.T) {
 		finished := make(chan struct{})
 		go func() {
 			defer close(finished)
-			rec, _ := do(t, s.authenticate(mux), "GET", "/api/boards/"+b.ID, "guest-00000001", nil)
+			rec, _ := do(t, s.authenticate(mux), "GET", "/api/boards/"+b.ID, b.OwnerID, nil)
 			if rec.Code != http.StatusOK {
 				t.Errorf("чтение доски: %d", rec.Code)
 			}

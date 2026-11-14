@@ -107,6 +107,7 @@ func TestActionDoneRequiresExplicitIdempotentState(t *testing.T) {
 					t.Fatalf("повтор должен сохранить состояние и версию решения: %v", repeated)
 				}
 			}
+			admitMembers(t, f.handler, f.id, mutationOwner, "stranger-00001")
 			rec, _ = do(t, f.handler, "POST", path+"/done", "stranger-00001", map[string]any{"done": true})
 			requireMutationStatus(t, rec, http.StatusForbidden)
 			rec, _ = do(t, f.handler, "PATCH", path, mutationAuthor,

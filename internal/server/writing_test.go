@@ -71,6 +71,7 @@ func TestWritingFifteenConcurrentParticipantsAdvanceOnce(t *testing.T) {
 			actors := []string{mutationOwner}
 			for i := 1; i < 15; i++ {
 				actor := fmt.Sprintf("participant-%02d", i)
+				admitMembers(t, f.handler, f.id, mutationOwner, actor)
 				writingJoin(t, f, actor)
 				actors = append(actors, actor)
 			}

@@ -115,6 +115,13 @@ class DeploymentTests(unittest.TestCase):
 
     def test_https_access_control_and_csrf(self):
         board = self.create_board()
+        path = "/api/boards/" + board["id"]
+        foreign_cookie = self.request("GET", "/", extra={"Cookie": ""})[2]["Set-Cookie"].split(";", 1)[0]
+        for target in ("/b/" + board["id"], path, path + "/history", path + "/export.md", path + "/events"):
+            status, raw, headers = self.request("GET", target, extra={"Cookie": foreign_cookie})
+            self.assertEqual(status, 404, target)
+            self.assertNotIn(board["title"].encode(), raw)
+            self.assertNotIn("Content-Disposition", headers)
         for path in ("/", "/static/app.js", "/api/templates", "/api/boards/" + board["id"],
                      f'/api/boards/{board["id"]}/history', f'/api/boards/{board["id"]}/export.md',
                      f'/api/boards/{board["id"]}/events'):

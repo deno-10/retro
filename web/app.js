@@ -9,7 +9,7 @@ const appPath = path => basePath + path;
 const corporateParticipant = document.querySelector('meta[name="retro-auth"]')?.content === 'baas' ? participant : '';
 const NAME_KEY = 'retro.name' + (corporateParticipant ? ':' + corporateParticipant : '');
 const ANON_KEY = 'retro.anonymous' + (corporateParticipant ? ':' + corporateParticipant : '');
-const RECENT_KEY = 'retro.recent' + (corporateParticipant ? ':' + corporateParticipant : '');
+const RECENT_KEY = 'retro.recent:' + participant;
 const TIMER_KEY = 'retro.timer' + (corporateParticipant ? ':' + corporateParticipant : '');
 
 function stored(key, fallback) {
@@ -135,6 +135,40 @@ function dots(n) {
     Array.from({ length: n }, () => h('i', { class: 'dot' })));
 }
 
+async function copyText(value, success) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const field = h('textarea', { value, readonly: true, class: 'clipboard-field' });
+      document.body.append(field);
+      try {
+        field.select();
+        if (!document.execCommand('copy')) throw new Error();
+      } finally {
+        field.remove();
+      }
+    }
+    toast(success);
+  } catch {
+    window.prompt('Скопируйте значение', value);
+  }
+}
+
+function copyParticipantButton() {
+  return h('button', { type: 'button', onclick: () => copyText(participant, 'ID участника скопирован') }, 'Скопировать мой ID');
+}
+
+function showUnavailable(root) {
+  document.title = 'Доска недоступна · Ретро';
+  root.hidden = false;
+  root.replaceChildren(h('main', { class: 'notfound' },
+    h('h1', {}, 'Доска недоступна'),
+    h('p', {}, 'Проверьте ссылку. Если она верная, отправьте ведущему свой ID участника. Когда он добавит вас на доску, обновите страницу.'),
+    copyParticipantButton(),
+    h('a', { href: '/' }, 'На главную')));
+}
+
 function brandLink(className = '') {
   return h('a', { href: '/', class: `brand-link ${className}`, 'aria-label': 'Авито · Ретро — на главную' },
     h('span', { class: 'brand-mark', 'aria-hidden': 'true' },
@@ -208,11 +242,12 @@ async function renderHome(root) {
     h('div', { class: 'create-heading' },
       h('span', { class: 'form-eyebrow' }, 'Новая доска'),
       h('h2', {}, 'Начнём ретро'),
-      h('p', { class: 'muted' }, 'Создайте доску и пригласите команду по ссылке.')),
+      h('p', { class: 'muted' }, 'Создайте доску и добавьте команду по ID участников.')),
     h('label', {}, 'Название', titleInput),
     h('label', {}, 'Шаблон', select),
     h('label', {}, 'Ваше имя', nameInput),
     submit,
+    copyParticipantButton(),
     h('p', { class: 'form-note' }, 'Можно писать анонимно. Вы решаете, когда открыть карточки.'),
   );
 
@@ -252,6 +287,9 @@ async function renderHome(root) {
     h('footer', { class: 'home-footer' },
       h('span', {}, 'Меньше недосказанности.'), h('strong', {}, 'Больше команды.')),
   );
+  // При возврате назад состав «Недавних» и ID должны принадлежать текущей сессии.
+  window.addEventListener('pagehide', () => { root.hidden = true; });
+  window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
 
   const recent = recentBoards();
   if (recent.length) {
@@ -277,6 +315,7 @@ async function renderHome(root) {
 // ---------- Доска ----------
 
 function renderBoardPage(root, id) {
+  root.hidden = true;
   let board = null;
   let online = 0;
   let editingId = null;
@@ -350,6 +389,8 @@ function renderBoardPage(root, id) {
     recoveryEl,
     columnsEl,
   );
+  const boardStatus = h('p', { class: 'access-status', role: 'status' }, 'Проверяем доступ к доске…');
+  root.before(boardStatus);
   restoreDrafts();
   renderRecovery();
 
@@ -549,6 +590,8 @@ function renderBoardPage(root, id) {
     if (next.online !== undefined) online = next.online;
     if (board?.writing?.round !== next.writing?.round) writingNotice = '';
     board = next;
+    boardStatus.hidden = true;
+    root.hidden = false;
     render();
     ensureWritingJoined();
     return true;
@@ -597,10 +640,26 @@ function renderBoardPage(root, id) {
 
   async function refreshBoard(options) {
     const generation = pageGeneration;
-    const next = await boardRequest('GET', `/api/boards/${id}`, undefined, options);
-    if (!isCurrent(generation)) throw inactiveRequest();
-    applyBoard(next);
-    return next;
+    try {
+      const next = await boardRequest('GET', `/api/boards/${id}`, undefined, options);
+      if (!isCurrent(generation)) throw inactiveRequest();
+      applyBoard(next);
+      return next;
+    } catch (err) {
+      if (isCurrent(generation)) {
+        if (err.status === 404) {
+          leaveBoard();
+          showUnavailable(root);
+        } else if (err.status === 409) {
+          leaveBoard();
+          location.reload();
+        } else if (err.status === 401) {
+          leaveBoard();
+          showUnavailable(root);
+        }
+      }
+      throw err;
+    }
   }
 
   function canWrite() {
@@ -852,21 +911,14 @@ function renderBoardPage(root, id) {
     }
   }
 
-  async function copyLink() {
-    const url = location.origin + appPath('/b/' + board.id);
+  async function addMember() {
+    const id = window.prompt('Вставьте ID коллеги. Он может скопировать его на главной странице Retro или по ссылке на доску.');
+    if (!id?.trim()) return;
     try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(url);
-      } else {
-        const ta = h('textarea', { value: url, readonly: true, style: 'position:fixed;left:-9999px' });
-        document.body.append(ta);
-        ta.select();
-        document.execCommand('copy');
-        ta.remove();
-      }
-      toast('Ссылка скопирована');
-    } catch {
-      toast('Не удалось скопировать. Ссылка: ' + url);
+      await mutate('POST', `/api/boards/${board.id}/members`, { participantId: id.trim() });
+      toast('Доступ открыт. Коллега может открыть ссылку на доску.');
+    } catch (err) {
+      reportError(err);
     }
   }
 
@@ -1046,7 +1098,11 @@ function renderBoardPage(root, id) {
         class: 'tool button', href: `/api/boards/${board.id}/export.md`, download: `retro-${board.id}.md`,
       }, 'Скачать .md'));
     }
-    items.push(h('button', { type: 'button', class: 'tool share-button', onclick: copyLink }, 'Скопировать ссылку'));
+    if (board.isOwner) {
+      items.push(h('button', { type: 'button', class: 'tool', onclick: addMember }, 'Добавить участника'));
+    }
+    items.push(h('button', { type: 'button', class: 'tool share-button',
+      onclick: () => copyText(location.origin + appPath('/b/' + board.id), 'Ссылка скопирована') }, 'Скопировать ссылку'));
     if (board.isOwner && board.phase === 'discuss' && !board.nextId) {
       items.push(h('button', {
         type: 'button', class: 'tool', onclick: createNextBoard,
@@ -1699,6 +1755,7 @@ function renderBoardPage(root, id) {
     if (polling || disposed) return;
     polling = true;
     setStatus('Нет связи с обновлениями, проверяем доску каждые 3 секунды…');
+    if (root.hidden) boardStatus.textContent = 'Восстанавливаем связь с доской…';
     pollBoard();
   }
 
@@ -1711,7 +1768,9 @@ function renderBoardPage(root, id) {
       const data = JSON.parse(e.data);
       if (data.participant !== participant) {
         stream.close();
-        setStatus('Участник изменился. Обновите страницу, чтобы продолжить.');
+        root.hidden = true;
+        boardStatus.hidden = false;
+        startPolling();
         return;
       }
       stopPolling();
@@ -1723,9 +1782,13 @@ function renderBoardPage(root, id) {
     stream.onerror = () => { if (eventSource === stream) startPolling(); };
   }
 
-  window.addEventListener('pagehide', () => {
+  function leaveBoard() {
+    if (disposed) return;
     persistDrafts();
     disposed = true;
+    root.hidden = true;
+    boardStatus.hidden = true;
+    document.title = 'Ретро';
     pageGeneration++;
     for (const controller of requests) controller.abort();
     stopPolling();
@@ -1734,9 +1797,16 @@ function renderBoardPage(root, id) {
     cancelAnimationFrame(renderFrame);
     eventSource?.close();
     eventSource = null;
-  });
+  }
+  window.addEventListener('pagehide', leaveBoard);
   window.addEventListener('pageshow', e => {
     if (!e.persisted) return;
+    if (!columnsEl.isConnected) {
+      location.reload();
+      return;
+    }
+    boardStatus.hidden = false;
+    boardStatus.textContent = 'Проверяем доступ к доске…';
     // Другой экземпляр этой доски в истории вкладки мог изменить или
     // удалить сохранённые черновики. Его снимок теперь актуальнее памяти
     // страницы из BFCache. Старые запросы уже отменены и сменили поколение.
@@ -1789,10 +1859,11 @@ function renderBoardPage(root, id) {
       connect();
     } catch (err) {
       if (!isCurrent(generation)) return;
-      const missing = err.status === 404;
+      boardStatus.hidden = true;
+      root.hidden = false;
       root.replaceChildren(h('div', { class: 'notfound' },
-        h('h1', {}, missing ? 'Доска не найдена' : 'Не удалось открыть доску'),
-        h('p', {}, missing ? 'Проверьте ссылку: возможно, доска была удалена.' : err.message),
+        h('h1', {}, 'Не удалось открыть доску'),
+        h('p', {}, err.message),
         h('a', { href: '/', class: 'button' }, 'На главную')));
     }
   })();
@@ -1807,6 +1878,7 @@ document.addEventListener('DOMContentLoaded', () => {
     return;
   }
   const m = location.pathname.slice(basePath.length).match(/^\/b\/([A-Za-z0-9]+)\/?$/);
-  if (m) renderBoardPage(root, m[1]);
+  if (document.querySelector('meta[name="retro-board-unavailable"]')) showUnavailable(root);
+  else if (m) renderBoardPage(root, m[1]);
   else renderHome(root);
 });

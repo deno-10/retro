@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -72,13 +74,14 @@ var (
 
 // Board — доска одного ретро.
 type Board struct {
-	ID        string `json:"id"`
-	Revision  uint64 `json:"revision"`
-	Title     string `json:"title"`
-	Template  string `json:"template"`
-	OwnerID   string `json:"ownerId"` // ведущий: создатель доски
-	Phase     Phase  `json:"phase"`
-	VoteLimit int    `json:"voteLimit"` // голосов на участника
+	ID        string              `json:"id"`
+	Revision  uint64              `json:"revision"`
+	Title     string              `json:"title"`
+	Template  string              `json:"template"`
+	OwnerID   string              `json:"ownerId"`           // ведущий: создатель доски
+	Members   map[string]struct{} `json:"members,omitempty"` // допущены ведущим, независимо от этапа записи
+	Phase     Phase               `json:"phase"`
+	VoteLimit int                 `json:"voteLimit"` // голосов на участника
 	// TimerEndsAt — конец таймера текущей фазы; nil — таймер не запущен.
 	// По истечении сервер переключает фазу через ExpireTimer.
 	TimerEndsAt *time.Time    `json:"timerEndsAt,omitempty"`
@@ -99,6 +102,37 @@ type Board struct {
 type MutationReceipt struct {
 	Operation   string `json:"operation"`
 	Fingerprint string `json:"fingerprint"`
+}
+
+var participantIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]{8,64}$`)
+
+func ValidParticipantID(id string) bool { return participantIDPattern.MatchString(id) }
+
+// HasMember не выводит права из авторства карточек или участия в старом этапе.
+// У доски без списка приглашённых доступ изначально есть только у ведущего.
+func (b *Board) HasMember(id string) bool {
+	_, admitted := b.Members[id]
+	return id != "" && (id == b.OwnerID || admitted)
+}
+
+func (b *Board) AddMember(id, actor string) (bool, error) {
+	if actor != b.OwnerID || actor == "" {
+		return false, ErrForbidden
+	}
+	if !ValidParticipantID(id) {
+		return false, fmt.Errorf("%w: скопируйте ID участника со страницы Retro", ErrInvalid)
+	}
+	if b.HasMember(id) {
+		return false, nil
+	}
+	if len(b.Members)+1 >= MaxWritingParticipants {
+		return false, fmt.Errorf("%w: не более %d участников доски", ErrCapacity, MaxWritingParticipants)
+	}
+	if b.Members == nil {
+		b.Members = make(map[string]struct{})
+	}
+	b.Members[id] = struct{}{}
+	return true, nil
 }
 
 // Action — решение ретро (action item): что сделать и кто отвечает.
@@ -231,6 +265,7 @@ func (prev *Board) NextBoard(title, actorID string) (*Board, error) {
 		return nil, err
 	}
 	b.PrevID = prev.ID
+	b.Members = maps.Clone(prev.Members)
 	b.VoteLimit = prev.VoteLimit
 	for _, a := range prev.Actions {
 		if a.Done {
