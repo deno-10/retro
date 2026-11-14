@@ -61,6 +61,7 @@ class DeploymentTests(unittest.TestCase):
         self.processes.append(subprocess.Popen([self.caddy_binary, "run", "--config", str(caddyfile), "--adapter", "caddyfile"], env=env, stdout=self.log, stderr=self.log))
         self.authorization = "Basic " + base64.b64encode(("team:" + password).encode()).decode()
         self.wait_ready()
+        self.cookie = self.request("GET", "/")[2]["Set-Cookie"].split(";", 1)[0]
 
     def start_backend(self):
         process = subprocess.Popen([self.binary, "-addr", f"127.0.0.1:{self.backend_port}", "-data", str(self.directory / "retro.db"), "-trusted-proxy", "127.0.0.1/32"], stdout=self.log, stderr=self.log)
@@ -78,7 +79,9 @@ class DeploymentTests(unittest.TestCase):
                     process.wait(timeout=3)
 
     def request(self, method, path, data=None, auth=True, extra=None):
-        headers = {"X-Participant": "owner-00000001", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if getattr(self, "cookie", None):
+            headers["Cookie"] = self.cookie
         if auth:
             headers["Authorization"] = self.authorization
         headers.update(extra or {})
@@ -114,7 +117,7 @@ class DeploymentTests(unittest.TestCase):
         board = self.create_board()
         for path in ("/", "/static/app.js", "/api/templates", "/api/boards/" + board["id"],
                      f'/api/boards/{board["id"]}/history', f'/api/boards/{board["id"]}/export.md',
-                     f'/api/boards/{board["id"]}/events?participant=owner-00000001'):
+                     f'/api/boards/{board["id"]}/events'):
             self.assertEqual(self.request("GET", path, auth=False)[0], 401, path)
         self.assertEqual(self.request("GET", "/", extra={"Authorization": "Basic d3Jvbmc6d3Jvbmc="})[0], 401)
         self.assertEqual(self.request("GET", "/metrics")[0], 404)
@@ -132,7 +135,7 @@ class DeploymentTests(unittest.TestCase):
         path = f'/api/boards/{board["id"]}'
         connection = http.client.HTTPSConnection("localhost", self.port, context=self.tls, timeout=5)
         self.addCleanup(connection.close)
-        connection.request("GET", path + "/events?participant=owner-00000001", headers={"Authorization": self.authorization})
+        connection.request("GET", path + "/events", headers={"Authorization": self.authorization, "Cookie": self.cookie})
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
 
@@ -190,7 +193,7 @@ class DeploymentTests(unittest.TestCase):
         import sqlite3
         with sqlite3.connect(restored) as db:
             data = json.loads(db.execute("SELECT data FROM boards WHERE id = ?", (board["id"],)).fetchone()[0])
-        self.assertEqual(data["ownerId"], "owner-00000001")
+        self.assertEqual(data["ownerId"], self.cookie.split("=", 1)[1].split(".", 1)[0])
         self.assertEqual(data["title"], board["title"])
 
 

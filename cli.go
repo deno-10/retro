@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"retro/internal/jira"
-	"retro/internal/server"
 	"retro/internal/store"
 )
 
@@ -31,15 +30,20 @@ func runCLI(ctx context.Context, args []string, out, errOut io.Writer) error {
 	var run func() error
 	switch command {
 	case "serve":
-		defaults := server.DefaultOptions()
-		addr := f.String("addr", ":8080", "адрес HTTP-сервера")
+		cfg, err := configFromEnv(os.Getenv)
+		if err != nil {
+			return err
+		}
+		*data = cfg.Data
+		defaults := cfg.Options
+		addr := f.String("addr", cfg.Addr, "адрес HTTP-сервера")
 		proxy := f.String("trusted-proxy", "", "CIDR доверенного прокси; только от него принимается X-Real-IP")
-		jsonLog := f.Bool("log-json", false, "структурированные JSON-логи")
+		jsonLog := f.Bool("log-json", cfg.JSONLog, "структурированные JSON-логи")
 		streamsIP := f.Int("sse-per-ip", defaults.SSEPerIP, "число SSE-соединений с одного IP, включая общий NAT команды")
 		streamsBoard := f.Int("sse-per-board", defaults.SSEPerBoard, "число SSE-соединений одной доски")
 		streamsTotal := f.Int("sse-total", defaults.SSETotal, "общее число SSE-соединений")
 		run = func() error {
-			opts := server.DefaultOptions()
+			opts := cfg.Options
 			if *streamsIP <= 0 || *streamsBoard <= 0 || *streamsTotal <= 0 {
 				return errors.New("лимиты SSE должны быть положительными")
 			}
@@ -60,10 +64,29 @@ func runCLI(ctx context.Context, args []string, out, errOut io.Writer) error {
 			if *jsonLog {
 				handler = slog.NewJSONHandler(out, nil)
 			}
-			return serve(ctx, *addr, *data, opts, slog.New(handler))
+			cfg.Addr, cfg.Data, cfg.Options = *addr, *data, opts
+			if err := cfg.validate(); err != nil {
+				return err
+			}
+			return serve(ctx, cfg, slog.New(handler))
+		}
+	case "migrate":
+		run = func() error {
+			st, err := store.OpenPostgres(os.Getenv("RETRO_DATABASE_URL"))
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			migrationCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			return st.Migrate(migrationCtx)
 		}
 	case "healthcheck":
-		url := f.String("url", "http://127.0.0.1:8080/readyz", "адрес проверки готовности")
+		defaultURL := "http://127.0.0.1:8080/readyz"
+		if os.Getenv("RETRO_PROFILE") == "paas" {
+			defaultURL = "http://127.0.0.1:8890/readyz"
+		}
+		url := f.String("url", defaultURL, "адрес проверки готовности")
 		run = func() error {
 			client := &http.Client{Timeout: 4 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, *url, nil)
@@ -122,7 +145,7 @@ func runCLI(ctx context.Context, args []string, out, errOut io.Writer) error {
 		participant := f.String("participant", "", "новый ID участника из браузера ведущего")
 		run = func() error { return store.TransferOwner(ctx, *data, *board, *participant) }
 	default:
-		return fmt.Errorf("неизвестная команда %q; доступны serve, healthcheck, backup, verify, restore, transfer-owner", command)
+		return fmt.Errorf("неизвестная команда %q; доступны serve, migrate, healthcheck, backup, verify, restore, transfer-owner", command)
 	}
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -132,6 +155,9 @@ func runCLI(ctx context.Context, args []string, out, errOut io.Writer) error {
 	}
 	if f.NArg() != 0 {
 		return fmt.Errorf("лишние аргументы: %v", f.Args())
+	}
+	if command != "serve" && command != "migrate" && command != "healthcheck" && (os.Getenv("RETRO_PROFILE") == "paas" || os.Getenv("RETRO_STORAGE") == "postgres") {
+		return errors.New("эта команда предназначена только для локального SQLite; PostgreSQL обслуживается средствами платформы")
 	}
 	return run()
 }

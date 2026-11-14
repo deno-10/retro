@@ -1,11 +1,9 @@
 const { test: nodeTest, before, after } = require('node:test');
 const test = (name, fn) => nodeTest(name, { timeout: 15000 }, fn);
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { asset } = require('./assets.cjs');
 const { chromium } = require('playwright');
 
-const webDir = path.resolve(__dirname, '../../web');
 const origin = 'http://retro.test';
 let browser;
 
@@ -31,7 +29,7 @@ async function openBoard(t) {
     actions: [{ id: 'action1', text: 'Исходное решение', assignee: 'Анна', mine: true, done: false, revision: 1 }],
   };
   await page.addInitScript(() => {
-    localStorage.setItem('retro.participant', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
     localStorage.setItem('retro.name', 'Анна');
     // Управляем доставкой SSE независимо от HTTP-ответов, включая их порядок.
     window.EventSource = class {
@@ -44,13 +42,13 @@ async function openBoard(t) {
     const url = new URL(route.request().url());
     if (url.pathname === '/api/boards/board1234') return route.fulfill({ json: board });
     if (url.pathname === '/static/app.js') return route.fulfill({
-      contentType: 'application/javascript', body: fs.readFileSync(path.join(webDir, 'app.js'), 'utf8'),
+      contentType: 'application/javascript', body: asset('app.js'),
     });
     if (url.pathname === '/static/style.css') return route.fulfill({
-      contentType: 'text/css', body: fs.readFileSync(path.join(webDir, 'style.css'), 'utf8'),
+      contentType: 'text/css', body: asset('style.css'),
     });
     if (url.pathname === '/b/board1234') return route.fulfill({
-      contentType: 'text/html', body: fs.readFileSync(path.join(webDir, 'index.html'), 'utf8'),
+      contentType: 'text/html', body: asset('index.html'),
     });
     return route.fulfill({ status: 404, json: { error: 'Неожиданный запрос' } });
   });
@@ -60,7 +58,7 @@ async function openBoard(t) {
     page, board,
     async emit(changes = {}) {
       Object.assign(board, changes);
-      await page.evaluate(value => window.testEvents.listeners.board({ data: JSON.stringify(value) }), board);
+      await page.evaluate(value => window.testEvents.listeners.board({ data: JSON.stringify({ ...value, participant: document.querySelector('meta[name="retro-participant"]').content }) }), board);
     },
   };
 }

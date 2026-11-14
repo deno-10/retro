@@ -10,7 +10,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '../..');
-const owner = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const { openGuest, useGuest } = require('./session.cjs');
+let owner;
 let directory, mock, processServer, browser, origin;
 let malformed = false;
 const issues = [];
@@ -62,6 +63,7 @@ before(async () => {
     if (Date.now() > deadline || processServer.exitCode !== null) throw new Error(`Тестовый Retro не запустился: ${log}`);
     await sleep(25);
   }
+  owner = await openGuest(origin);
   browser = await chromium.launch({ headless: true,
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } : { channel: 'chromium' }),
   });
@@ -79,7 +81,7 @@ after(async () => {
 });
 
 async function api(method, route, body) {
-  const response = await fetch(origin+route, { method, headers: { 'Content-Type': 'application/json', 'X-Participant': owner },
+  const response = await fetch(origin+route, { method, headers: { 'Content-Type': 'application/json', 'X-Participant': owner.id, Cookie: owner.cookie },
     body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10000) });
   const result = await response.json();
   assert.ok(response.ok, `Ошибка API ${response.status}: ${JSON.stringify(result)}`);
@@ -92,7 +94,7 @@ async function fixture(t) {
   let current;
   for (const text of ['Алерты', 'Ревью', 'Оставить в Retro']) current = await api('POST', `/api/boards/${board.id}/actions`, { text, assignee: 'Анна' });
   const page = await browser.newPage(); page.setDefaultTimeout(8000); t.after(() => page.close());
-  await page.addInitScript(id => localStorage.setItem('retro.participant', id), owner);
+  await useGuest(page.context(), origin, owner);
   await page.goto(`${origin}/b/${board.id}`);
   await page.getByText('Алерты', { exact: true }).waitFor();
   return { page, board: current };

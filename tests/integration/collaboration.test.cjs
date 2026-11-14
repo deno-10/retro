@@ -10,6 +10,7 @@ const path = require('node:path');
 const { setTimeout: sleep } = require('node:timers/promises');
 const { promisify } = require('node:util');
 const { chromium } = require('playwright');
+const { openGuest, useGuest } = require('./session.cjs');
 
 const root = path.resolve(__dirname, '../..');
 const token = () => randomBytes(16).toString('hex');
@@ -83,7 +84,7 @@ async function api(method, route, participant, body, key) {
   const response = await fetch(origin + route, {
     method,
     headers: {
-      'Content-Type': 'application/json', 'X-Participant': participant,
+      'Content-Type': 'application/json', 'X-Participant': participant.id, Cookie: participant.cookie,
       ...(key ? { 'Idempotency-Key': key } : {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -92,8 +93,86 @@ async function api(method, route, participant, body, key) {
   return { status: response.status, data: await response.json() };
 }
 
+async function writingPage(t, id, participant, polling) {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  await useGuest(context, origin, participant);
+  const page = await context.newPage();
+  page.setDefaultTimeout(10000);
+  if (polling) await page.route(`${origin}/api/boards/${id}/events`, route => route.abort());
+  await page.goto(`${origin}/b/${id}`);
+  await page.getByRole('button', { name: 'Я закончил', exact: true }).waitFor();
+  return page;
+}
+
+for (const polling of [false, true]) test(`Готовность с настоящим ${polling ? 'опросом без SSE' : 'SSE'}: все участники открывают карточки до таймера`, async t => {
+  const [owner, author, third] = await Promise.all([openGuest(origin), openGuest(origin), openGuest(origin)]);
+  const created = await api('POST', '/api/boards', owner, { title: 'Готовность команды' });
+  assert.equal(created.status, 201);
+  const id = created.data.id;
+  const route = `/api/boards/${id}`;
+  assert.equal((await api('POST', route + '/timer', owner, { minutes: 5 })).status, 200);
+  const leaderPage = await writingPage(t, id, owner, polling);
+  const authorPage = await writingPage(t, id, author, polling);
+  const duplicatePage = await writingPage(t, id, author, polling);
+  let thirdPage = await writingPage(t, id, third, polling);
+  await leaderPage.getByText('Готовы: 0 из 3', { exact: true }).waitFor();
+  await authorPage.getByPlaceholder('Новая карточка').first().fill('Карточка до завершения записи');
+  await authorPage.getByRole('button', { name: 'Добавить', exact: true }).first().click();
+  await authorPage.getByRole('main').getByText('Карточка до завершения записи', { exact: true }).waitFor();
+  await authorPage.getByRole('button', { name: 'Повторить отправку', exact: true }).waitFor({ state: 'hidden' });
+  await leaderPage.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  await authorPage.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  await leaderPage.getByText('Готовы: 2 из 3', { exact: true }).waitFor();
+  await duplicatePage.getByRole('button', { name: 'Продолжить писать', exact: true }).waitFor();
+  let current = (await api('GET', route, owner)).data;
+  assert.equal(current.phase, 'write');
+  assert.equal(current.columns[0].cards[0].hidden, true);
+  await thirdPage.close();
+  current = (await api('GET', route, owner)).data;
+  assert.equal(current.phase, 'write', 'закрытие вкладки не считается готовностью');
+  assert.equal(current.writing.participants, 3);
+  thirdPage = await writingPage(t, id, third, polling);
+  await thirdPage.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  for (const page of [leaderPage, authorPage, duplicatePage, thirdPage]) {
+    await page.getByText('Все карточки открыты. Прочитайте и дополните.', { exact: false }).waitFor();
+    await page.getByRole('main').getByText('Карточка до завершения записи', { exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Я закончил', exact: true }).count(), 0);
+    assert.equal(await page.getByRole('timer').count(), 0);
+  }
+  current = (await api('GET', route, author)).data;
+  assert.equal(current.phase, 'reveal');
+  assert.equal(current.timerEndsAt, undefined);
+});
+
+test('Готовность: повтор этапа сбрасывает отметки во всех браузерах и отвергает старый запрос', async t => {
+  const [owner, author] = await Promise.all([openGuest(origin), openGuest(origin)]);
+  const { data: board } = await api('POST', '/api/boards', owner, { title: 'Новый этап записи' });
+  const route = `/api/boards/${board.id}`;
+  const leaderPage = await writingPage(t, board.id, owner, false);
+  const authorPage = await writingPage(t, board.id, author, false);
+  await leaderPage.getByText('Готовы: 0 из 2', { exact: true }).waitFor();
+  await leaderPage.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  await leaderPage.getByRole('button', { name: 'Продолжить писать', exact: true }).click();
+  await authorPage.getByRole('button', { name: 'Я закончил', exact: true }).click();
+  await leaderPage.getByText('Готовы: 1 из 2', { exact: true }).waitFor();
+  assert.equal((await api('GET', route, owner)).data.phase, 'write');
+  await api('POST', route + '/phase', owner, { phase: 'reveal' });
+  await api('POST', route + '/phase', owner, { phase: 'write' });
+  for (const page of [leaderPage, authorPage]) {
+    await page.getByText('Готовы: 0 из 2', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Я закончил', exact: true }).waitFor();
+  }
+  const old = await api('POST', route + '/writing/ready', author, { ready: true, round: 1, revision: 0 });
+  assert.equal(old.status, 409);
+  const current = (await api('GET', route, author)).data;
+  assert.equal(current.phase, 'write');
+  assert.equal(current.writing.ready, 0);
+  assert.equal(current.writing.round, 2);
+});
+
 async function fixture() {
-  const owner = token(), author = token();
+  const [owner, author] = await Promise.all([openGuest(origin), openGuest(origin)]);
   const created = await api('POST', '/api/boards', owner, { title: `Интеграция ${token()}`, template: 'classic' });
   assert.equal(created.status, 201);
   const id = created.data.id;
@@ -107,14 +186,14 @@ async function fixture() {
 async function pageFor(t, fixture, participant, { disconnected = false } = {}) {
   const context = await browser.newContext();
   t.after(() => context.close());
-  await context.addInitScript(participant => {
-    localStorage.setItem('retro.participant', participant);
+  await useGuest(context, origin, participant);
+  await context.addInitScript(() => {
     localStorage.setItem('retro.name', 'Участник');
-  }, participant);
+  });
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
   if (disconnected) {
-    await page.route(`${origin}/api/boards/${fixture.id}/events?*`, route => route.abort());
+    await page.route(`${origin}/api/boards/${fixture.id}/events`, route => route.abort());
     await allowInitialBoardRead(page, fixture.id);
   }
   await page.goto(`${origin}/b/${fixture.id}`);
@@ -395,8 +474,8 @@ test('Настоящий Back/Forward с SSE сохраняет новую оч�
   const f = await fixture();
   const context = await browser.newContext();
   t.after(() => context.close());
-  await context.addInitScript(owner => {
-    localStorage.setItem('retro.participant', owner);
+  await useGuest(context, origin, f.owner);
+  await context.addInitScript(() => {
     window.testDocumentID = crypto.randomUUID();
     window.testRestored = false;
     addEventListener('pageshow', event => { window.testRestored = event.persisted; });
@@ -410,11 +489,11 @@ test('Настоящий Back/Forward с SSE сохраняет новую оч�
       }
       return nativeFetch(url, options);
     };
-  }, f.owner);
+  });
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
   const path = `/b/${f.id}`;
-  const storageKey = `retro.drafts.v1:${f.id}:${f.owner}`;
+  const storageKey = `retro.drafts.v1:${f.id}:${f.owner.id}`;
   const snapshot = () => page.evaluate(key => JSON.parse(sessionStorage.getItem(key)), storageKey);
   const editor = field(page, `draft:${f.board.columns[0].id}`);
   await page.goto(origin + path);
@@ -478,7 +557,10 @@ test('Отказ localStorage не меняет владельца, чернов
   assert.match(owner, /^[a-f0-9]{32}$/);
   await page.waitForURL(/\/b\/[a-f0-9]+$/);
   const id = new URL(page.url()).pathname.split('/').pop();
-  const board = (await api('GET', `/api/boards/${id}`, owner)).data;
+  const ownerCookie = (await context.cookies(origin)).find(c => c.name === 'retro_session');
+  assert.ok(ownerCookie.httpOnly);
+  const guest = { id: owner, cookie: ownerCookie.name + '=' + ownerCookie.value };
+  const board = (await api('GET', `/api/boards/${id}`, guest)).data;
   assert.equal(board.isOwner, true);
   const editor = field(page, `draft:${board.columns[0].id}`);
   const url = `${origin}/api/boards/${id}/cards`;
@@ -505,7 +587,7 @@ test('Отказ localStorage не меняет владельца, чернов
   assert.equal(request.headers()['x-participant'], owner);
   assert.equal(request.headers()['idempotency-key'], originalKey);
   await recovery.getByText('Создано до потери ответа', { exact: true }).waitFor({ state: 'detached' });
-  const current = (await api('GET', `/api/boards/${id}`, owner)).data;
+  const current = (await api('GET', `/api/boards/${id}`, guest)).data;
   assert.equal(current.columns[0].cards.length, 1);
 });
 
@@ -516,7 +598,7 @@ test('Пустой таймер и лишние данные после JSON о�
   assert.equal(started.status, 200);
   for (const body of ['{}', '{"minutes":null}', 'null', '{"minutes":0} THIS IS NOT JSON', '{"minutes":0} null']) {
     const response = await fetch(origin + route, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Participant': f.owner },
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Participant': f.owner.id, Cookie: f.owner.cookie },
       body, signal: AbortSignal.timeout(5000),
     });
     assert.equal(response.status, 400, body);
@@ -526,7 +608,7 @@ test('Пустой таймер и лишние данные после JSON о�
     assert.equal(current.revision, started.data.revision);
   }
   const stopped = await fetch(origin + route, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Participant': f.owner },
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Participant': f.owner.id, Cookie: f.owner.cookie },
     body: '{"minutes":0} \n\t', signal: AbortSignal.timeout(5000),
   });
   assert.equal(stopped.status, 200);

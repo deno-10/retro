@@ -6,6 +6,8 @@
 .DS_Store
 *.tmp
 /.env
+retro-session.key
+.retro-session-*
 /deploy/secrets/
 *.db
 *.db-wal

@@ -116,15 +116,18 @@ input:focus, select:focus, textarea:focus {
 }
 
 /* ---------- Знак и шапка ---------- */
-.brand-link { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); text-decoration: none; flex-shrink: 0; }
-.brand-name { font-size: 34px; font-weight: 800; line-height: 1; letter-spacing: -.065em; }
-.brand-team { font: italic 27px/1 Georgia, serif; letter-spacing: -.06em; transform: rotate(-7deg); margin: 4px 0 0 -3px; }
-.brand-mark { display: block; width: 36px; height: 36px; position: relative; flex: 0 0 36px; }
+.brand-link { display: inline-flex; align-items: flex-start; gap: 9px; color: var(--ink); text-decoration: none; flex-shrink: 0; }
+.brand-labels { display: grid; gap: 6px; }
+.brand-company { font-size: 44px; font-weight: 800; line-height: 1; letter-spacing: -.04em; }
+.brand-title { display: inline-flex; align-items: center; gap: 9px; }
+.brand-name { font-size: 22px; font-weight: 800; line-height: 1; letter-spacing: -.045em; }
+.brand-team { font: italic 20px/1 Georgia, serif; letter-spacing: -.06em; transform: rotate(-7deg); margin: 2px 0 0 -3px; }
+.brand-mark { --mark-size: 44px; display: block; width: var(--mark-size); height: var(--mark-size); position: relative; flex: 0 0 var(--mark-size); }
 .brand-mark i { display: block; position: absolute; border-radius: 50%; }
-.brand-mark i:nth-child(1) { width: 19px; height: 19px; left: 0; top: 2px; background: var(--sky); }
-.brand-mark i:nth-child(2) { width: 14px; height: 14px; right: 0; top: 0; background: var(--purple); }
-.brand-mark i:nth-child(3) { width: 12px; height: 12px; left: 3px; bottom: 0; background: var(--mint); }
-.brand-mark i:nth-child(4) { width: 19px; height: 19px; right: 0; bottom: 0; background: var(--coral); }
+.brand-mark i:nth-child(1) { width: 48%; height: 48%; right: 0; top: 0; background: var(--sky); }
+.brand-mark i:nth-child(2) { width: 23%; height: 23%; left: 25%; top: 7%; background: var(--purple); }
+.brand-mark i:nth-child(3) { width: 60%; height: 60%; left: 0; bottom: 0; background: var(--mint); }
+.brand-mark i:nth-child(4) { width: 37%; height: 37%; right: 0; bottom: 4%; background: var(--coral); }
 .home-header-inner { max-width: 1400px; margin: auto; padding: 28px 48px; display: flex; justify-content: space-between; align-items: center; gap: 24px; }
 .home-brand { display: flex; align-items: center; }
 .home-nav { display: flex; align-items: center; gap: 32px; }
@@ -187,8 +190,10 @@ input:focus, select:focus, textarea:focus {
 .topbar { position: sticky; top: 0; z-index: 10; display: grid; grid-template-columns: minmax(200px, 1fr) auto; align-items: center; gap: 20px 28px; padding: 22px 28px 16px; background: #151515; color: white; border-bottom: 0; }
 .topbar-left { display: flex; align-items: center; gap: 24px; min-width: 0; }
 .topbar .brand-link { color: white; }
-.topbar .brand-name { font-size: 27px; }
-.topbar .brand-team { font-size: 23px; }
+.topbar .brand-company { font-size: 34px; }
+.topbar .brand-mark { --mark-size: 34px; }
+.topbar .brand-name { font-size: 19px; }
+.topbar .brand-team { font-size: 18px; }
 .board-title { border-left: 1px solid #444; padding-left: 24px; font-size: 20px; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tools { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; font-size: 12px; color: #ccc; padding-top: 16px; border-top: 1px solid #363636; }
 .tool { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
@@ -218,7 +223,7 @@ button.phase:hover:not(:disabled) { background: #484848; color: white; }
 .timer.over { color: white; background: var(--danger); }
 .timer[hidden], .status[hidden], .draft-warning[hidden] { display: none; }
 .status { color: var(--danger); font-weight: 600; }
-.draft-warning, .identity-warning { margin: 12px 28px; padding: 14px; border: 1px solid #f0b0ba; border-radius: 12px; color: var(--danger); background: #fff7f8; }
+.draft-warning { margin: 12px 28px; padding: 14px; border: 1px solid #f0b0ba; border-radius: 12px; color: var(--danger); background: #fff7f8; }
 
 /* Цепочка ретроспектив */
 .chain { display: flex; align-items: center; gap: 8px; font-size: 12px; white-space: nowrap; margin-left: auto; }
@@ -236,6 +241,18 @@ button.phase:hover:not(:disabled) { background: #484848; color: white; }
 a.history-title:hover { color: var(--brand); }
 .history-meta { grid-column: 2; color: var(--muted); font-size: 12px; }
 .history li.muted { display: block; }
+
+/* ---------- Готовность на этапе записи ---------- */
+.writing-ready { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin: 20px 28px 0; padding: 18px 22px; border-radius: 20px; background: #edf9df; }
+.writing-ready[hidden] { display: none; }
+.writing-ready-copy { min-width: 0; }
+.writing-ready strong { display: block; font-size: 18px; font-weight: 800; }
+.writing-ready p { margin: 5px 0 0; color: #48543e; font-size: 13px; }
+.writing-ready .writing-notice { color: #714518; }
+.writing-ready button { flex-shrink: 0; }
+@media (max-width: 760px) {
+  .writing-ready { margin: 16px 16px 0; padding: 18px; flex-direction: column; align-items: stretch; gap: 14px; }
+}
 
 /* ---------- Колонки и карточки ---------- */
 .columns { display: flex; gap: 16px; padding: 20px 28px 48px; overflow-x: auto; align-items: flex-start; }
@@ -358,13 +375,14 @@ a.history-title:hover { color: var(--brand); }
   .column { width: 100%; flex: 0 0 auto; }
   .chain { margin-left: 0; flex-wrap: wrap; white-space: normal; }
   .history { right: auto; left: 0; width: min(280px, calc(100vw - 32px)); }
-  .draft-warning, .identity-warning { margin-left: 16px; margin-right: 16px; }
+  .draft-warning { margin-left: 16px; margin-right: 16px; }
 }
 @media (max-width: 480px) {
   .home-header-inner { padding: 22px 20px; gap: 14px; }
-  .home-header .brand-name { font-size: 29px; }
-  .home-header .brand-team { font-size: 24px; }
-  .home-header .brand-mark { transform: scale(.9); margin-right: -4px; }
+  .home-header .brand-company { font-size: 34px; }
+  .home-header .brand-name { font-size: 20px; }
+  .home-header .brand-team { font-size: 18px; }
+  .home-header .brand-mark { --mark-size: 34px; }
   .home-nav .header-cta { padding: 8px 8px 8px 14px; font-size: 11px; gap: 10px; }
   .header-cta .button-arrow { width: 25px; height: 25px; font-size: 18px; }
   .home-page { padding: 28px 20px 40px; gap: 40px; }
@@ -384,6 +402,8 @@ a.history-title:hover { color: var(--brand); }
   .home-footer { font-size: 12px; padding: 24px 20px 32px; }
 }
 @media (max-width: 350px) {
+  .home-header .brand-company { font-size: 30px; }
+  .home-header .brand-mark { --mark-size: 30px; }
   .home-header .brand-team { display: none; }
   .hero h1 { font-size: 40px; }
   .create { padding: 24px 20px; }

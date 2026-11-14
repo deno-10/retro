@@ -26,7 +26,7 @@ func jiraHandler(t *testing.T, st store.Store, client *jira.Client) http.Handler
 	t.Helper()
 	h := hub.New()
 	t.Cleanup(h.Close)
-	options := DefaultOptions()
+	options := testOptions()
 	options.Jira = client
 	return New(st, h, fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}},
 		slog.New(slog.NewTextHandler(io.Discard, nil)), options)
@@ -234,7 +234,7 @@ func TestJiraValidationAndDefiniteFailureRetry(t *testing.T) {
 		}
 	}
 	req := httptest.NewRequest("POST", endpoint, strings.NewReader(`{"revision":1} {}`))
-	req.Header.Set("X-Participant", jiraOwner)
+	testGuest(req, jiraOwner)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 400 || creates.Load() != 0 {

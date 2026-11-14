@@ -37,25 +37,46 @@ func main() {
 	}
 }
 
-func serve(ctx context.Context, addr, dataFile string, options server.Options, logger *slog.Logger) error {
+func serve(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 	// Сначала занимаем порт: ошибка запуска возвращается вызывающему коду,
 	// до открытия/миграции данных и до сообщения об успешном запуске.
-	listener, err := net.Listen("tcp", addr)
+	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return fmt.Errorf("не удалось открыть порт: %w", err)
 	}
 	defer listener.Close()
-	st, err := openStore(dataFile, logger)
+	var st store.Store
+	if cfg.Storage == "postgres" {
+		st, err = store.OpenPostgres(cfg.DatabaseURL)
+	} else {
+		st, err = openStore(cfg.Data, logger)
+	}
 	if err != nil {
 		return fmt.Errorf("не удалось открыть хранилище: %w", err)
 	}
 	defer st.Close()
+	if cfg.Storage == "postgres" {
+		readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = st.(*store.PostgresStore).Ready(readyCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("схема PostgreSQL не готова; выполните migrate: %w", err)
+		}
+	}
 	static, err := fs.Sub(webFS, "web")
 	if err != nil {
 		return err
 	}
 	h := hub.New()
 	defer h.Close()
+	options := cfg.Options
+	if options.AuthMode != "baas" {
+		options.SessionKey, err = loadSessionKey(filepath.Join(filepath.Dir(cfg.Data), "retro-session.key"))
+		if err != nil {
+			return fmt.Errorf("не удалось открыть ключ сессий: %w", err)
+		}
+	}
+	options.SharedStore = cfg.Storage == "postgres"
 	srv := &http.Server{
 		Handler:           server.New(st, h, static, logger, options),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -66,9 +87,13 @@ func serve(ctx context.Context, addr, dataFile string, options server.Options, l
 		// ставит отдельный дедлайн на каждый ответ/запись в поток.
 	}
 	result := make(chan error, 1)
-	logger.Info("retro запущен", "addr", listener.Addr().String(), "data", dataFile)
-	for _, u := range shareURLs(listener.Addr().String(), lanIPs()) {
-		logger.Info("ссылка для команды", "url", u)
+	logger.Info("retro запущен", "addr", listener.Addr().String(), "storage", cfg.Storage)
+	if cfg.Options.PublicOrigin != "" {
+		logger.Info("ссылка для команды", "url", cfg.Options.PublicOrigin+cfg.Options.BasePath+"/")
+	} else {
+		for _, u := range shareURLs(listener.Addr().String(), lanIPs()) {
+			logger.Info("ссылка для команды", "url", u)
+		}
 	}
 	go func() { result <- srv.Serve(listener) }()
 

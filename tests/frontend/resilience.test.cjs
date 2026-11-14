@@ -1,11 +1,9 @@
 const { test: nodeTest, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { asset } = require('./assets.cjs');
 const { chromium } = require('playwright');
 const test = (name, fn) => nodeTest(name, { timeout: 20000 }, fn);
 const origin = 'http://retro.test';
-const webDir = path.resolve(__dirname, '../../web');
 const participant = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const storageKey = `retro.drafts.v1:board1234:${participant}`;
 const clone = value => structuredClone(value);
@@ -34,8 +32,7 @@ async function openBoard(t, options = {}) {
     ] }],
     actions: [{ id: 'action1', text: 'Решение', assignee: 'Анна', mine: true, done: false, revision: 1 }],
   };
-  await page.addInitScript(({ pid, storageKey, fault, bodyHang }) => {
-    if (!localStorage.getItem('retro.participant')) localStorage.setItem('retro.participant', pid);
+  await page.addInitScript(({ storageKey, fault, bodyHang }) => {
     if (fault === 'invalid') sessionStorage.setItem(storageKey, '{"version":999}');
     if (fault === 'quota') {
       const setItem = Storage.prototype.setItem;
@@ -66,22 +63,24 @@ async function openBoard(t, options = {}) {
         return fetch(url, options);
       };
     }
-  }, { pid: participant, storageKey, fault: options.fault, bodyHang: options.bodyHang });
+  }, { storageKey, fault: options.fault, bodyHang: options.bodyHang });
+  let viewer = participant;
   await page.route(`${origin}/**`, route => {
     const url = new URL(route.request().url());
     const match = url.pathname.match(/^\/api\/boards\/([A-Za-z0-9]+)$/);
     if (match) return route.fulfill({ json: { ...board, id: match[1] } });
     const name = url.pathname === '/static/app.js' ? 'app.js' : url.pathname === '/static/style.css' ? 'style.css' : 'index.html';
     return route.fulfill({ contentType: name.endsWith('.js') ? 'application/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html',
-      body: fs.readFileSync(path.join(webDir, name), 'utf8') });
+      body: asset(name, viewer) });
   });
   await page.goto(`${origin}/b/board1234`);
   await page.locator('.board-title').waitFor();
   return {
     page, context,
+    setViewer(id) { viewer = id; },
     get board() { return clone(board); },
     set board(value) { board = clone(value); },
-    emit(value) { return page.evaluate(data => window.testEvents.listeners.board({ data: JSON.stringify(data) }), value); },
+    emit(value) { return page.evaluate(data => window.testEvents.listeners.board({ data: JSON.stringify({ ...data, participant: document.querySelector('meta[name="retro-participant"]').content }) }), value); },
   };
 }
 async function snapshot(page) {
@@ -140,16 +139,10 @@ test('Черновики разделены по доске, участнику 
   await field(page, 'draft:col1').fill('Доска B');
   await page.goto(`${origin}/b/board1234`);
   assert.equal(await field(page, 'draft:col1').inputValue(), 'Доска A');
-  await page.evaluate(() => {
-    localStorage.setItem('retro.participant', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
-    sessionStorage.setItem('retro.participant', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
-  });
+  env.setViewer('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
   await page.reload();
   assert.equal(await field(page, 'draft:col1').inputValue(), '');
-  await page.evaluate(pid => {
-    localStorage.setItem('retro.participant', pid);
-    sessionStorage.setItem('retro.participant', pid);
-  }, participant);
+  env.setViewer(participant);
   await page.reload();
   assert.equal(await field(page, 'draft:col1').inputValue(), 'Доска A');
   const other = await openBoard(t, { context: env.context });

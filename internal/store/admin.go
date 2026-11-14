@@ -9,7 +9,7 @@ import (
 )
 
 // TransferOwner доступна только через локальный CLI администратора, не HTTP.
-// Нужна после потери browser storage. Смена владельца не меняет авторов карточек.
+// Нужна после потери cookie или перехода со старых браузерных ID. Смена владельца не меняет авторов карточек.
 func TransferOwner(ctx context.Context, path, boardID, participantID string) error {
 	if !regexp.MustCompile(`^[A-Za-z0-9-]{8,64}$`).MatchString(participantID) || boardID == "" {
 		return fmt.Errorf("%w: укажите доску и корректный ID нового ведущего", model.ErrInvalid)

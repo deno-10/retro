@@ -105,11 +105,7 @@ func (s *Server) handleCheckJira(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-s.jiraSlots }()
-	pid, err := participant(r)
-	if err != nil {
-		s.writeErr(w, err)
-		return
-	}
+	pid := participant(r)
 	b, err := s.store.Get(r.PathValue("id"))
 	if err != nil {
 		s.writeErr(w, err)

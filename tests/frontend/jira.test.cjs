@@ -1,9 +1,7 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { asset } = require('./assets.cjs');
 const { chromium } = require('playwright');
-const web = path.resolve(__dirname, '../../web');
 const origin = 'http://retro.test';
 let browser;
 before(async () => {
@@ -32,7 +30,7 @@ async function fixture(t, changes = {}) {
     await route.fulfill({ json: board });
   };
   await page.addInitScript(() => {
-    localStorage.setItem('retro.participant', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
     window.EventSource = class {
       constructor() { window.testEvents = this; this.listeners = {}; }
       addEventListener(name, fn) { this.listeners[name] = fn; }
@@ -45,13 +43,13 @@ async function fixture(t, changes = {}) {
     const match = pathname.match(/\/actions\/(action\d)\/jira(\/check)?$/);
     if (match) return handler(route, match[1], !!match[2]);
     const file = pathname === '/b/board1234' ? 'index.html' : pathname === '/static/app.js' ? 'app.js' : pathname === '/static/style.css' ? 'style.css' : null;
-    if (file) return route.fulfill({ contentType: file.endsWith('.js') ? 'application/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', body: fs.readFileSync(path.join(web, file)) });
+    if (file) return route.fulfill({ contentType: file.endsWith('.js') ? 'application/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', body: asset(file) });
     return route.fulfill({ status: 404, body: '' });
   });
   await page.goto(origin+'/b/board1234');
   await page.getByText('Настроить алерты', { exact: true }).waitFor();
   return { page, sent, get board() { return board; }, set handler(value) { handler = value; },
-    emit: () => page.evaluate(data => window.testEvents.listeners.board({ data: JSON.stringify(data) }), board) };
+    emit: () => page.evaluate(data => window.testEvents.listeners.board({ data: JSON.stringify({ ...data, participant: document.querySelector('meta[name="retro-participant"]').content }) }), board) };
 }
 const select = (page, name) => page.getByRole('checkbox', { name: `Выбрать для Jira: ${name}`, exact: true });
 const send = page => page.getByRole('button', { name: /^Создать в Jira/ });

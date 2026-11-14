@@ -75,7 +75,7 @@ func (f *mutationFixture) serveWith(st store.Store) {
 	}
 	f.hub = hub.New()
 	f.handler = New(st, f.hub, fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), testOptions())
 }
 
 func (f *mutationFixture) phase(phase string) {
@@ -115,7 +115,7 @@ func mutationRequest(t *testing.T, method, path, actor, key string, body any) *h
 	}
 	req := httptest.NewRequest(method, path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Participant", actor)
+	testGuest(req, actor)
 	if key != "" {
 		req.Header.Set("Idempotency-Key", key)
 	}

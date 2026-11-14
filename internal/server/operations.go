@@ -19,6 +19,12 @@ import (
 // Options — ограничения одного экземпляра. Идентификатор участника и
 // присланный клиентом X-Forwarded-For не служат ключами ограничения нагрузки.
 type Options struct {
+	SessionKey        [32]byte
+	AuthMode          string
+	BaaSSpace         string
+	PublicOrigin      string
+	BasePath          string // внешний префикс; шлюз удаляет его перед проксированием
+	SharedStore       bool
 	Jira              *jira.Client
 	TrustedProxy      netip.Prefix
 	RequestsPerSecond float64
@@ -218,9 +224,17 @@ func (s *Server) protect(next http.Handler) http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "private, no-store")
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				if s.options.AuthMode == "baas" && r.Header.Get("Origin") == "" {
+					writeJSON(w, http.StatusForbidden, map[string]string{"error": "Origin обязателен"})
+					return
+				}
 				if origin := r.Header.Get("Origin"); origin != "" {
 					u, err := url.Parse(origin)
-					if err != nil || u.Scheme != s.requestScheme(r) || u.Host != r.Host || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+					expected := s.options.PublicOrigin
+					if expected == "" {
+						expected = s.requestScheme(r) + "://" + r.Host
+					}
+					if err != nil || origin != expected || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 						writeJSON(w, http.StatusForbidden, map[string]string{"error": "запрос с другого сайта запрещён"})
 						return
 					}
@@ -304,7 +318,7 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 		if status == 429 {
 			s.stats.limited.Add(1)
 		}
-		if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/metrics" {
+		if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/_info" || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/metrics" {
 			return
 		}
 		// Не записываем query, Authorization и тела: там участники и тексты ретро.

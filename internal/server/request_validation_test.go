@@ -16,7 +16,7 @@ import (
 func rawJSONRequest(h http.Handler, method, path, body, key string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Participant", mutationOwner)
+	testGuest(req, mutationOwner)
 	if key != "" {
 		req.Header.Set("Idempotency-Key", key)
 	}

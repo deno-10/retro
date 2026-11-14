@@ -50,7 +50,7 @@ func TestReadinessReflectsStoreAndShutdown(t *testing.T) {
 
 func TestTrafficDoesNotTrustClientHeaders(t *testing.T) {
 	for _, trusted := range []bool{false, true} {
-		opts := DefaultOptions()
+		opts := testOptions()
 		opts.RequestBurst, opts.RequestsPerSecond = 1, 0
 		if trusted {
 			opts.TrustedProxy = netip.MustParsePrefix("192.0.2.0/24")
@@ -72,7 +72,7 @@ func TestTrafficDoesNotTrustClientHeaders(t *testing.T) {
 }
 
 func TestRateLimitRefillAndCreationBudget(t *testing.T) {
-	o := DefaultOptions()
+	o := testOptions()
 	o.RequestBurst, o.RequestsPerSecond = 3, 1
 	o.CreateBurst, o.CreatesPerMinute = 1, 1
 	g := newTrafficGuard(o)
@@ -90,7 +90,7 @@ func TestRateLimitRefillAndCreationBudget(t *testing.T) {
 }
 
 func TestStreamQuotasAreAtomicAndReleased(t *testing.T) {
-	o := DefaultOptions()
+	o := testOptions()
 	o.SSEPerIP, o.SSEPerBoard, o.SSETotal = 1, 2, 3
 	g := newTrafficGuard(o)
 	ip := netip.MustParseAddr("127.0.0.1")
@@ -133,13 +133,13 @@ func TestStreamQuotasAreAtomicAndReleased(t *testing.T) {
 
 func TestHTTPRateLimitAndCrossSiteRequests(t *testing.T) {
 	st, _ := store.OpenJSON(filepath.Join(t.TempDir(), "retro.json"))
-	o := DefaultOptions()
+	o := testOptions()
 	o.RequestBurst, o.RequestsPerSecond = 1, 0
 	h := New(st, hub.New(), fstest.MapFS{"index.html": {Data: []byte("ok")}}, slog.New(slog.NewTextHandler(io.Discard, nil)), o)
 	request := func(method, path, origin string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, strings.NewReader(`{"title":"Ретро"}`))
 		r.Header.Set("Origin", origin)
-		r.Header.Set("X-Participant", "owner-00000001")
+		testGuest(r, "owner-00000001")
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		return w
@@ -184,7 +184,8 @@ func (w *failingFlush) SetWriteDeadline(deadline time.Time) error {
 func TestSSEFlushFailureReleasesCapacityAndPreservesDeadline(t *testing.T) {
 	f := newMutationFixture(t, "db")
 	w := &failingFlush{header: make(http.Header)}
-	r := httptest.NewRequest("GET", "/api/boards/"+f.id+"/events?participant="+mutationOwner, nil)
+	r := httptest.NewRequest("GET", "/api/boards/"+f.id+"/events", nil)
+	testGuest(r, mutationOwner)
 	f.handler.ServeHTTP(w, r)
 	if len(w.deadlines) < 2 || w.deadlines[len(w.deadlines)-1].IsZero() {
 		t.Fatal("SSE не поставил дедлайн записи через обёртку логов")
@@ -243,14 +244,16 @@ func TestSSESurvivesIdleLongerThanWriteDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := hub.New()
-	o := DefaultOptions()
+	o := testOptions()
 	o.WriteTimeout = 25 * time.Millisecond
 	handler := New(st, h, fstest.MapFS{"index.html": {Data: []byte("ok")}}, slog.New(slog.NewTextHandler(io.Discard, nil)), o)
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 	defer h.Close()
 	client := &http.Client{Timeout: 3 * time.Second}
-	response, err := client.Get(ts.URL + "/api/boards/" + b.ID + "/events?participant=" + b.OwnerID)
+	req, _ := http.NewRequest("GET", ts.URL + "/api/boards/" + b.ID + "/events", nil)
+	testGuest(req, b.OwnerID)
+	response, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

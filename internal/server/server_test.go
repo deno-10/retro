@@ -30,7 +30,7 @@ func newTestServerWithStore(t *testing.T) (http.Handler, store.Store) {
 		t.Fatal(err)
 	}
 	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
-	return New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil))), st
+	return New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil)), testOptions()), st
 }
 
 func do(t *testing.T, h http.Handler, method, path, participant string, body any) (*httptest.ResponseRecorder, map[string]any) {
@@ -43,7 +43,7 @@ func do(t *testing.T, h http.Handler, method, path, participant string, body any
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Participant", participant)
+	testGuest(req, participant)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	out := map[string]any{}
@@ -112,8 +112,8 @@ func TestBoardFlow(t *testing.T) {
 		t.Fatalf("несуществующая доска: %d", rec.Code)
 	}
 	rec, _ = do(t, h, "GET", "/api/boards/"+id, "x", nil)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("короткий идентификатор участника: %d", rec.Code)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("неподтверждённый идентификатор участника: %d", rec.Code)
 	}
 }
 
@@ -154,7 +154,7 @@ func TestNextBoardAndHistory(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/api/boards/"+second+"/history", nil)
-	req.Header.Set("X-Participant", alice)
+	testGuest(req, alice)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	var chain []map[string]any
