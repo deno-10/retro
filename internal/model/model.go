@@ -81,9 +81,10 @@ type Board struct {
 	VoteLimit int    `json:"voteLimit"` // голосов на участника
 	// TimerEndsAt — конец таймера текущей фазы; nil — таймер не запущен.
 	// По истечении сервер переключает фазу через ExpireTimer.
-	TimerEndsAt *time.Time `json:"timerEndsAt,omitempty"`
-	Columns     []Column   `json:"columns"`
-	Actions     []Action   `json:"actions"` // решения ретро
+	TimerEndsAt *time.Time    `json:"timerEndsAt,omitempty"`
+	Writing     *WritingState `json:"writing,omitempty"`
+	Columns     []Column      `json:"columns"`
+	Actions     []Action      `json:"actions"` // решения ретро
 	// PrevID и NextID связывают ретро одной команды в цепочку: следующее
 	// ретро создаётся из предыдущего и забирает его незакрытые решения.
 	PrevID    string    `json:"prevId,omitempty"`
@@ -202,6 +203,7 @@ func NewBoard(title, templateID, ownerID string) (*Board, error) {
 	for _, name := range t.Columns {
 		b.Columns = append(b.Columns, Column{ID: NewID(), Title: name, Cards: []Card{}})
 	}
+	b.Writing = b.writingState()
 	return b, nil
 }
 
@@ -295,6 +297,9 @@ func (b *Board) AddCard(columnID, text, author, authorID string) (*Card, error) 
 	}
 	for i := range b.Columns {
 		if b.Columns[i].ID == columnID {
+			if err := b.noteWritingActivity(authorID); err != nil {
+				return nil, err
+			}
 			c := Card{
 				ID:        NewID(),
 				Revision:  1,
@@ -342,6 +347,9 @@ func (b *Board) EditCard(cardID, text, actorID string, expectedRevision uint64) 
 	if err != nil {
 		return err
 	}
+	if err := b.noteWritingActivity(actorID); err != nil {
+		return err
+	}
 	c.Text = text
 	c.Revision++
 	return nil
@@ -354,6 +362,9 @@ func (b *Board) DeleteCard(cardID, actorID string) error {
 		return fmt.Errorf("%w: карточка не найдена", ErrNotFound)
 	}
 	if err := b.canEdit(c, actorID); err != nil {
+		return err
+	}
+	if err := b.noteWritingActivity(actorID); err != nil {
 		return err
 	}
 	group := c.GroupID
@@ -584,6 +595,9 @@ func (b *Board) SetPhase(p Phase, actorID string) error {
 	}
 	if p != b.Phase {
 		b.TimerEndsAt = nil // таймер относится к фазе и вместе с ней заканчивается
+		if p == PhaseWrite {
+			b.restartWriting()
+		}
 	}
 	b.Phase = p
 	return nil
@@ -753,6 +767,7 @@ func (b *Board) SetVoteLimit(n int, actorID string) error {
 // BoardView — доска глазами конкретного участника: чужие карточки в фазе
 // записи скрыты, голоса видны только с фазы голосования.
 type BoardView struct {
+	Writing     *WritingView    `json:"writing,omitempty"`
 	Jira        *JiraConfigView `json:"jira,omitempty"`
 	ID          string          `json:"id"`
 	Revision    uint64          `json:"revision"`
@@ -809,6 +824,7 @@ type ActionView struct {
 func (b *Board) View(viewer string) BoardView {
 	showVotes := b.Phase == PhaseVote || b.Phase == PhaseDiscuss
 	v := BoardView{
+		Writing:     b.writingView(viewer),
 		ID:          b.ID,
 		Revision:    b.Revision,
 		Title:       b.Title,

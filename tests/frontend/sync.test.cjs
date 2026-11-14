@@ -1,11 +1,9 @@
 const { test: nodeTest, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { asset } = require('./assets.cjs');
 const { chromium } = require('playwright');
 const test = (name, fn) => nodeTest(name, { timeout: 15000 }, fn);
 const origin = 'http://retro.test';
-const webDir = path.resolve(__dirname, '../../web');
 const copy = value => structuredClone(value);
 let browser;
 before(async () => {
@@ -31,7 +29,7 @@ async function openBoard(t, clock = false) {
   };
   let reads = 0;
   await page.addInitScript(() => {
-    localStorage.setItem('retro.participant', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
     window.EventSource = class {
       constructor() { window.testEvents = this; this.listeners = {}; this.closed = false; }
       addEventListener(name, listener) { this.listeners[name] = listener; }
@@ -42,12 +40,12 @@ async function openBoard(t, clock = false) {
     const pathname = new URL(route.request().url()).pathname;
     if (pathname === '/api/boards/board1234') { reads++; return route.fulfill({ json: serverBoard }); }
     if (pathname === '/b/board1234') return route.fulfill({
-      contentType: 'text/html', body: fs.readFileSync(path.join(webDir, 'index.html'), 'utf8'),
+      contentType: 'text/html', body: asset('index.html'),
     });
     const name = pathname === '/static/app.js' ? 'app.js' : pathname === '/static/style.css' ? 'style.css' : null;
     if (name) return route.fulfill({
       contentType: name.endsWith('.js') ? 'application/javascript' : 'text/css',
-      body: fs.readFileSync(path.join(webDir, name), 'utf8'),
+      body: asset(name),
     });
     return route.fulfill({ status: 404, json: { error: 'Неожиданный запрос' } });
   });
@@ -58,7 +56,7 @@ async function openBoard(t, clock = false) {
     get board() { return copy(serverBoard); },
     set board(value) { serverBoard = copy(value); },
     get reads() { return reads; },
-    emit(value) { return page.evaluate(data => window.testEvents.listeners.board({ data: JSON.stringify(data) }), value); },
+    emit(value) { return page.evaluate(data => window.testEvents.listeners.board({ data: JSON.stringify({ ...data, participant: document.querySelector('meta[name="retro-participant"]').content }) }), value); },
     disconnect() { return page.evaluate(() => window.testEvents.onerror()); },
   };
 }

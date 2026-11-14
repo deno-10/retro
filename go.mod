@@ -1,8 +1,11 @@
 module retro
 
-go 1.26.0
+go 1.27.4
 
-require modernc.org/sqlite v1.61.1
+require (
+	github.com/lib/pq v1.12.3
+	modernc.org/sqlite v1.61.1
+)
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect

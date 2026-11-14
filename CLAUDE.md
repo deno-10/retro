@@ -27,7 +27,7 @@ go build -o retro .
 docker build -t retro . && docker run -d -p 8080:8080 -v retro-data:/app/data retro
 ```
 
-Go 1.26+ is required (`go.mod` pins it because `modernc.org/sqlite` needs it; `GOTOOLCHAIN=auto` downloads it). Routing uses `net/http` method+pattern muxing (`"GET /api/boards/{id}"`, `r.PathValue`) and `http.FileServerFS`. There is no frontend build step; `web/` is served as-is via `//go:embed`, so changes to `web/*` require restarting the Go process (a browser reload alone is not enough).
+Go 1.27.4+ is required (`go.mod` sets the patched toolchain minimum; `GOTOOLCHAIN=auto` downloads it). Routing uses `net/http` method+pattern muxing (`"GET /api/boards/{id}"`, `r.PathValue`) and `http.FileServerFS`. There is no frontend build step; `web/` is served as-is via `//go:embed`, so changes to `web/*` require restarting the Go process (a browser reload alone is not enough).
 
 `data/` and the `retro` binary are gitignored. Tests use `t.TempDir()` and never touch `data/`.
 
@@ -49,7 +49,7 @@ Four packages with strict dependency direction: `server → store, hub, model`; 
 
 ### Participant identity
 
-The app has no per-user authentication. Production Compose requires shared Basic authentication at Caddy over HTTPS; it never publishes the backend port. This closes access to the team, not to individual boards within the team. The browser pins a 32-hex id in `sessionStorage` for the tab, reusing a valid `localStorage` id on the first visit or generating one. Writes must be verified by reading them back. A valid session id wins on reload; never overwrite a different valid local id or treat a failed read as an empty store. Show a persistent warning if only session persistence works, or if neither store retains the id. The browser sends it as the `X-Participant` header (or `?participant=` for SSE, since `EventSource` cannot set headers). The server validates it as 8–64 chars of `[A-Za-z0-9-]`. The board's `ownerId` is simply the creator's participant id; "owner" checks everywhere are `actorID == b.OwnerID`. The local admin CLI can transfer ownership after storage loss; there is no HTTP ownership recovery endpoint.
+Local and shared-password deployments issue a signed, persistent HttpOnly guest cookie on the HTML page. HTTPS uses a Secure host-only cookie. The public participant ID in the page binds drafts and detects stale tabs through X-Participant. SSE uses the cookie and returns the viewer ID in its event. Never accept client IDs as credentials or allow unsigned legacy ID migration. Recover ownership of an old SQLite board through the local transfer-owner CLI. BaaS authenticates through the trusted gateway. Preserve existing BaaS identity derivation and isolated draft keys.
 
 ### Frontend (`web/app.js`)
 
@@ -57,7 +57,7 @@ Single file, no framework. `h(tag, attrs, ...children)` builds DOM nodes (text i
 
 ## Testing conventions
 
-Tests live beside the code as `*_test.go`. `server_test.go` builds a full handler with `store.OpenJSON(t.TempDir())`, `hub.New()`, an `fstest.MapFS` for static files and a discarded `slog` logger, then drives it with `httptest` and raw `map[string]any` JSON assertions. Model tests use a `newTestBoard` helper with owner id `owner-1`. Participant ids in server tests must be ≥ 8 characters or the request is rejected with 400.
+Tests live beside the code as `*_test.go`. `server_test.go` builds a full handler with `store.OpenJSON(t.TempDir())`, `hub.New()`, an `fstest.MapFS` for static files and a discarded `slog` logger, then drives it with `httptest` and raw `map[string]any` JSON assertions. Model tests use a `newTestBoard` helper with owner id `owner-1`. Local API test requests use a signed cookie for each fixture participant. Requests without credentials return 401.
 
 Browser regressions live in `tests/frontend/` and use Node’s test runner with Playwright. Run `npm test` after frontend changes. They load the real web assets with controlled HTTP/SSE responses to check draft preservation and delayed request failures.
 

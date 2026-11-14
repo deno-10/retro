@@ -1,13 +1,11 @@
 const { test: nodeTest, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { asset } = require('./assets.cjs');
 const { chromium } = require('playwright');
 const test = (name, fn) => nodeTest(name, { timeout: 20000 }, fn);
 const origin = 'http://retro.test';
 const participant = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const storageKey = `retro.drafts.v1:board1234:${participant}`;
-const webDir = path.resolve(__dirname, '../../web');
 const field = (page, key) => page.locator(`[data-keep="${key}"]`);
 const recovery = page => page.getByRole('region', { name: 'Неотправленные записи' });
 let browser;
@@ -32,8 +30,8 @@ async function openBoard(t) {
     ] }],
     actions: [{ id: 'action1', text: 'Решение', assignee: 'Анна', mine: true, done: false, revision: 1 }],
   };
-  await page.addInitScript(pid => {
-    localStorage.setItem('retro.participant', pid);
+  await page.addInitScript(() => {
+
     window.streams = [];
     window.EventSource = class {
       constructor() { this.listeners = {}; window.streams.push(this); }
@@ -55,13 +53,13 @@ async function openBoard(t) {
       }
       return fetch(url, options);
     };
-  }, participant);
+  });
   await page.route(`${origin}/**`, route => {
     const url = new URL(route.request().url());
     if (url.pathname === '/api/boards/board1234') return route.fulfill({ json: board });
     const name = url.pathname === '/static/app.js' ? 'app.js' : url.pathname === '/static/style.css' ? 'style.css' : 'index.html';
     return route.fulfill({ contentType: name.endsWith('.js') ? 'application/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html',
-      body: fs.readFileSync(path.join(webDir, name), 'utf8') });
+      body: asset(name) });
   });
   await page.goto(`${origin}/b/board1234`);
   await field(page, 'draft:col1').waitFor();

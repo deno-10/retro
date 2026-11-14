@@ -3,14 +3,18 @@
 package server
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,8 +35,8 @@ type Server struct {
 	jiraSlots chan struct{}
 
 	// timers — запланированные срабатывания таймеров фаз по id доски.
-	// Планировщик живёт в памяти процесса; после рестарта таймеры
-	// восстанавливаются лениво — при первом чтении доски (syncTimer).
+	// Планировщик живёт в памяти процесса; syncTimer восстанавливает его
+	// при чтении. PostgreSQL дополнительно проверяет просроченные таймеры фоном.
 	mu     sync.Mutex
 	timers map[string]*phaseTimer
 }
@@ -63,12 +67,19 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	if len(options) > 0 {
 		s.options = options[0]
 	}
+	if err := s.options.ValidatePlatform(); err != nil {
+		panic(err)
+	}
+	if s.options.AuthMode != "baas" && s.options.SessionKey == ([32]byte{}) {
+		rand.Read(s.options.SessionKey[:])
+	}
 	s.traffic = newTrafficGuard(s.options)
 	s.stats = &metrics{started: time.Now()}
 	s.jiraSlots = make(chan struct{}, 4)
 
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", s.handleHealth)
+	m.HandleFunc("GET /_info", s.handleHealth)
 	m.HandleFunc("GET /readyz", s.handleReady)
 	m.HandleFunc("GET /metrics", s.handleMetrics)
 	m.HandleFunc("GET /api/templates", s.handleTemplates)
@@ -77,6 +88,8 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	m.HandleFunc("GET /api/boards/{id}/events", s.handleEvents)
 	m.HandleFunc("GET /api/boards/{id}/export.md", s.handleExport)
 	m.HandleFunc("POST /api/boards/{id}/phase", s.handleSetPhase)
+	m.HandleFunc("POST /api/boards/{id}/writing/join", s.handleJoinWriting)
+	m.HandleFunc("POST /api/boards/{id}/writing/ready", s.handleWritingReady)
 	m.HandleFunc("POST /api/boards/{id}/vote-limit", s.handleSetVoteLimit)
 	m.HandleFunc("POST /api/boards/{id}/timer", s.handleSetTimer)
 	m.HandleFunc("POST /api/boards/{id}/next", s.handleNextBoard)
@@ -98,28 +111,12 @@ func New(st store.Store, h *hub.Hub, static fs.FS, log *slog.Logger, options ...
 	m.HandleFunc("GET /b/{id}", s.handleIndex)
 	m.HandleFunc("GET /{$}", s.handleIndex)
 
-	return s.withLogging(s.protect(m))
+	go s.recoverTimers()
+	return s.withLogging(s.protect(s.authenticate(m)))
 }
 
-// participant — идентификатор участника. Браузер генерирует его один раз
-// и присылает в заголовке X-Participant (для SSE — в query, EventSource
-// заголовки не умеет). Это не аутентификация; SSO появится позже.
-func participant(r *http.Request) (string, error) {
-	pid := r.Header.Get("X-Participant")
-	if pid == "" {
-		pid = r.URL.Query().Get("participant")
-	}
-	if len(pid) < 8 || len(pid) > 64 {
-		return "", fmt.Errorf("%w: нет идентификатора участника", model.ErrInvalid)
-	}
-	for _, c := range pid {
-		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-		isDigit := c >= '0' && c <= '9'
-		if !isLetter && !isDigit && c != '-' {
-			return "", fmt.Errorf("%w: некорректный идентификатор участника", model.ErrInvalid)
-		}
-	}
-	return pid, nil
+func participant(r *http.Request) string {
+	return r.Context().Value(identityKey{}).(string)
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) error {
@@ -180,10 +177,7 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn func(b *model
 // updateBoard также используется для двух коротких транзакций вокруг запроса
 // к Jira. Сетевой вызов никогда не выполняется под блокировкой хранилища.
 func (s *Server) updateBoard(r *http.Request, fn func(b *model.Board, pid string) error) (*model.Board, string, error) {
-	pid, err := participant(r)
-	if err != nil {
-		return nil, pid, err
-	}
+	pid := participant(r)
 	id := r.PathValue("id")
 	var operationErr error
 	b, err := s.store.Update(id, func(bd *model.Board) error {
@@ -406,11 +400,7 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateBoard(w http.ResponseWriter, r *http.Request) {
-	pid, err := participant(r)
-	if err != nil {
-		s.writeErr(w, err)
-		return
-	}
+	pid := participant(r)
 	var in struct {
 		Title    string `json:"title"`
 		Template string `json:"template"`
@@ -433,11 +423,7 @@ func (s *Server) handleCreateBoard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetBoard(w http.ResponseWriter, r *http.Request) {
-	pid, err := participant(r)
-	if err != nil {
-		s.writeErr(w, err)
-		return
-	}
+	pid := participant(r)
 	b, err := s.store.Get(r.PathValue("id"))
 	if err != nil {
 		s.writeErr(w, err)
@@ -619,11 +605,7 @@ func (s *Server) handleSetActionDone(w http.ResponseWriter, r *http.Request) {
 // handleNextBoard создаёт следующее ретро и связь с предыдущим атомарно:
 // при сбое хранилища ни новая доска, ни ссылка на неё не сохраняются.
 func (s *Server) handleNextBoard(w http.ResponseWriter, r *http.Request) {
-	pid, err := participant(r)
-	if err != nil {
-		s.writeErr(w, err)
-		return
-	}
+	pid := participant(r)
 	var in struct {
 		Title string `json:"title"`
 	}
@@ -717,11 +699,14 @@ func (s *Server) handleSetTimer(w http.ResponseWriter, r *http.Request) {
 // участников) клиент получает событие board с полным представлением доски.
 // Доски маленькие, поэтому проще слать всё целиком, чем дифф.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	pid, err := participant(r)
-	if err != nil {
-		s.writeErr(w, err)
-		return
+	if s.options.AuthMode == "baas" {
+		// Повторное подключение проходит через BaaS и заново проверяет сессию.
+		// Поток с прежней учётной записью не должен жить бесконечно после выхода.
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		r = r.WithContext(ctx)
 	}
+	pid := participant(r)
 	id := r.PathValue("id")
 	release, ok := s.traffic.acquireStream(s.traffic.clientIP(r), id)
 	if !ok {
@@ -766,16 +751,29 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}()
 	s.hub.Notify(id) // первое событие нам и обновление счётчика остальным
 
-	send := func() bool {
+	var sentRevision uint64
+	var sent bool
+	send := func(changedOnly bool) bool {
 		b, err := s.store.Get(id)
 		if err != nil {
 			return false
 		}
 		b = s.syncTimer(b)
+		if changedOnly && sent && sentRevision == b.Revision {
+			return true
+		}
+		sent, sentRevision = true, b.Revision
+		online := s.hub.Count(id)
+		// Для общего хранилища локальный Hub не знает число вкладок на других
+		// узлах. Не выдаём эту величину за онлайн всей команды.
+		if s.options.SharedStore {
+			online = -1
+		}
 		payload := struct {
 			model.BoardView
-			Online int `json:"online"`
-		}{s.view(b, pid), s.hub.Count(id)}
+			Online      int    `json:"online"`
+			Participant string `json:"participant"`
+		}{s.view(b, pid), online, pid}
 		data, err := json.Marshal(payload)
 		if err != nil {
 			return false
@@ -785,6 +783,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer heartbeat.Stop()
+	var refresh <-chan time.Time
+	if s.options.SharedStore {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		refresh = ticker.C
+	}
 	for {
 		select {
 		case <-r.Context().Done():
@@ -792,7 +796,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-s.hub.Done():
 			return
 		case <-signals:
-			if !send() {
+			if !send(false) {
+				return
+			}
+		case <-refresh:
+			if !send(true) {
 				return
 			}
 		case <-heartbeat.C:
@@ -821,6 +829,16 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(s.index)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	index := string(s.index)
+	prefix := s.options.BasePath
+	index = strings.ReplaceAll(index, `="/static/`, `="`+prefix+`/static/`)
+	meta := `<meta name="retro-base-path" content="` + html.EscapeString(prefix) + `">`
+	meta += `<meta name="retro-participant" content="` + html.EscapeString(participant(r)) + `">`
+	if s.options.AuthMode == "baas" {
+		w.Header().Set("Cache-Control", "private, no-store")
+		meta += `<meta name="retro-auth" content="baas">`
+	}
+	index = strings.Replace(index, "</head>", meta+"\n</head>", 1)
+	_, _ = io.WriteString(w, index)
 }

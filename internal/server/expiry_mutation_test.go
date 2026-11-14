@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"io"
 	"log/slog"
@@ -122,6 +123,7 @@ func TestRejectedMutationKeepsOnlyExpiryAndDiscardsPartialChanges(t *testing.T) 
 				signals, unsubscribe := f.hub.Subscribe(f.id)
 				defer unsubscribe()
 				req := mutationRequest(t, "POST", "/api/boards/"+f.id+"/probe", mutationAuthor, "", nil)
+				req = req.WithContext(context.WithValue(req.Context(), identityKey{}, mutationAuthor))
 				req.SetPathValue("id", f.id)
 				rec = httptest.NewRecorder()
 				s.mutate(rec, req, func(b *model.Board, pid string) error {

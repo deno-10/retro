@@ -40,10 +40,12 @@ def main():
         compose = ["docker", "compose", "--project-name", name, "--project-directory", directory, "-f", str(project / "compose.yaml")]
         context = ssl._create_unverified_context()
 
+        cookie = ""
+
         def request(path, method="GET", data=None):
             req = urllib.request.Request("https://localhost" + path, method=method,
                 data=json.dumps(data).encode() if data is not None else None,
-                headers={"Authorization": "Basic dGVhbTp0ZXN0LW9ubHk=", "X-Participant": "owner-00000001", "Content-Type": "application/json", "Origin": "https://localhost"})
+                headers={"Authorization": "Basic dGVhbTp0ZXN0LW9ubHk=", "Cookie": cookie, "Content-Type": "application/json", "Origin": "https://localhost"})
             with urllib.request.urlopen(req, context=context, timeout=3) as response:
                 return json.load(response)
 
@@ -62,6 +64,9 @@ def main():
             run(*compose, "config", "--quiet")
             run(*compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "60")
             ready()
+            root = urllib.request.Request("https://localhost/", headers={"Authorization": "Basic dGVhbTp0ZXN0LW9ubHk="})
+            with urllib.request.urlopen(root, context=context, timeout=3) as response:
+                cookie = response.headers["Set-Cookie"].split(";", 1)[0]
             board = request("/api/boards", "POST", {"title": "Перезапуск контейнера"})
             run(*compose, "restart", "retro")
             ready()

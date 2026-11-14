@@ -1,0 +1,4 @@
+# Объединить с auth.toml созданного PaaS-сервиса. Требует включённого mTLS.
+version = "0.2"
+[default]
+clients = ["baas-kong-gateway"]

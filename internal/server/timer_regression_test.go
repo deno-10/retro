@@ -31,7 +31,7 @@ func newTimerRegressionServer(t *testing.T) (*Server, *model.Board) {
 	}
 	s := &Server{
 		store: st, hub: hub.New(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		timers: map[string]*phaseTimer{},
+		timers: map[string]*phaseTimer{}, options: testOptions(),
 	}
 	t.Cleanup(func() {
 		s.mu.Lock()
@@ -97,13 +97,13 @@ func TestTimerGETSnapshotBeforePOSTDoesNotCancelTimer(t *testing.T) {
 		finished := make(chan struct{})
 		go func() {
 			defer close(finished)
-			rec, _ := do(t, mux, "GET", "/api/boards/"+b.ID, "guest-00000001", nil)
+			rec, _ := do(t, s.authenticate(mux), "GET", "/api/boards/"+b.ID, "guest-00000001", nil)
 			if rec.Code != http.StatusOK {
 				t.Errorf("чтение доски: %d", rec.Code)
 			}
 		}()
 		<-paused.captured // GET уже прочитал доску без таймера.
-		rec, _ := do(t, mux, "POST", "/api/boards/"+b.ID+"/timer", b.OwnerID, map[string]any{"minutes": 1})
+		rec, _ := do(t, s.authenticate(mux), "POST", "/api/boards/"+b.ID+"/timer", b.OwnerID, map[string]any{"minutes": 1})
 		close(paused.resume) // POST сохранил и запланировал таймер раньше GET.
 		<-finished
 		if rec.Code != http.StatusOK {
@@ -292,7 +292,7 @@ func TestTimerPOSTRecoversFromFirstSyncReadFailure(t *testing.T) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("POST /api/boards/{id}/timer", s.handleSetTimer)
 		retry.fail.Store(true)
-		rec, _ := do(t, mux, "POST", "/api/boards/"+b.ID+"/timer", b.OwnerID, map[string]any{"minutes": 1})
+		rec, _ := do(t, s.authenticate(mux), "POST", "/api/boards/"+b.ID+"/timer", b.OwnerID, map[string]any{"minutes": 1})
 		if rec.Code != http.StatusOK {
 			t.Fatalf("запуск таймера: %d %s", rec.Code, rec.Body.String())
 		}

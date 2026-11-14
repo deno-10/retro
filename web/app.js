@@ -2,11 +2,15 @@
 
 // ---------- Хранилище браузера ----------
 
-const PID_KEY = 'retro.participant';
-const NAME_KEY = 'retro.name';
-const ANON_KEY = 'retro.anonymous';
-const RECENT_KEY = 'retro.recent';
-const TIMER_KEY = 'retro.timer';
+const basePath = document.querySelector('meta[name="retro-base-path"]')?.content || '';
+const participant = document.querySelector('meta[name="retro-participant"]')?.content || '';
+const appPath = path => basePath + path;
+
+const corporateParticipant = document.querySelector('meta[name="retro-auth"]')?.content === 'baas' ? participant : '';
+const NAME_KEY = 'retro.name' + (corporateParticipant ? ':' + corporateParticipant : '');
+const ANON_KEY = 'retro.anonymous' + (corporateParticipant ? ':' + corporateParticipant : '');
+const RECENT_KEY = 'retro.recent' + (corporateParticipant ? ':' + corporateParticipant : '');
+const TIMER_KEY = 'retro.timer' + (corporateParticipant ? ':' + corporateParticipant : '');
 
 function stored(key, fallback) {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -22,35 +26,6 @@ function randomId() {
   crypto.getRandomValues(bytes);
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
-
-const identity = (() => {
-  const valid = id => typeof id === 'string' && /^[a-f0-9]{32}$/.test(id);
-  const read = storage => {
-    try { return { value: window[storage].getItem(PID_KEY), readable: true }; }
-    catch { return { value: null, readable: false }; }
-  };
-  const save = (storage, id) => {
-    try {
-      window[storage].setItem(PID_KEY, id);
-      return read(storage).value === id;
-    } catch { return false; }
-  };
-  const localRead = read('localStorage');
-  const sessionRead = read('sessionStorage');
-  const local = localRead.value;
-  const session = sessionRead.value;
-  // Привязка вкладки не меняется, даже если localStorage снова стал
-  // доступен или другая вкладка записала туда другого участника.
-  const id = valid(session) ? session : valid(local) ? local : randomId();
-  // Ошибка чтения не означает пустое хранилище: не затираем неизвестный
-  // существующий идентификатор, если запись при этом ещё разрешена.
-  const durable = local === id || (localRead.readable && !valid(local) && save('localStorage', id));
-  const inSession = session === id || (sessionRead.readable && save('sessionStorage', id));
-  return { id, warning: durable ? '' : inSession
-    ? 'Идентификатор участника сохранён только в этой вкладке. Не закрывайте её: после закрытия доступ к вашим доскам может потеряться.'
-    : 'Браузер не сохраняет идентификатор участника. После обновления или закрытия страницы доступ к вашим доскам и черновикам может потеряться.' };
-})();
-const participant = identity.id;
 
 function authorName() {
   return stored(ANON_KEY, '0') === '1' ? '' : stored(NAME_KEY, '');
@@ -84,6 +59,7 @@ function h(tag, attrs = {}, ...children) {
     else if (k === 'dataset') Object.assign(el.dataset, v);
     else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
     else if (k === 'value') el.value = v;
+    else if (k === 'href' && typeof v === 'string' && v.startsWith('/') && !v.startsWith('//')) el.setAttribute(k, appPath(v));
     else if (v === true) el.setAttribute(k, '');
     else el.setAttribute(k, v);
   }
@@ -107,7 +83,7 @@ async function api(method, path, body, options = {}) {
   const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
   try {
     const request = (async () => {
-      const res = await fetch(path, {
+      const res = await fetch(appPath(path), {
         method, cache: 'no-store',
         headers: {
           'Content-Type': 'application/json', 'X-Participant': participant,
@@ -160,11 +136,14 @@ function dots(n) {
 }
 
 function brandLink(className = '') {
-  return h('a', { href: '/', class: `brand-link ${className}`, 'aria-label': 'Ретро — на главную' },
+  return h('a', { href: '/', class: `brand-link ${className}`, 'aria-label': 'Авито · Ретро — на главную' },
     h('span', { class: 'brand-mark', 'aria-hidden': 'true' },
       Array.from({ length: 4 }, () => h('i'))),
-    h('span', { class: 'brand-name' }, 'ретро'),
-    h('span', { class: 'brand-team', 'aria-hidden': 'true' }, 'team'));
+    h('span', { class: 'brand-labels' },
+      h('span', { class: 'brand-company' }, 'Авито'),
+      h('span', { class: 'brand-title' },
+        h('span', { class: 'brand-name' }, 'ретро'),
+        h('span', { class: 'brand-team', 'aria-hidden': 'true' }, 'team'))));
 }
 
 // Перерисовка заменяет DOM целиком. Чтобы набираемый текст и фокус не
@@ -219,7 +198,7 @@ async function renderHome(root) {
       try {
         const board = await api('POST', '/api/boards', { title: titleInput.value, template: select.value });
         rememberBoard(board.id, board.title);
-        location.href = '/b/' + board.id;
+        location.href = appPath('/b/' + board.id);
       } catch (err) {
         toast(err.message);
         submit.disabled = false;
@@ -314,6 +293,10 @@ function renderBoardPage(root, id) {
   let jiraBusy = false;
   let jiraNotice = '';
   let actionPending = false;
+  let writingPending = false;
+  let joiningRound = null;
+  let joinFailedRound = null;
+  let writingNotice = '';
   const unsent = [];
   let composing = false;
   let renderPending = false;
@@ -342,6 +325,7 @@ function renderBoardPage(root, id) {
   const hintEl = h('p', { class: 'hint' });
   const timerEl = h('span', { class: 'timer', role: 'timer', hidden: true });
   const statusEl = h('span', { class: 'status', hidden: true });
+  const writingEl = h('section', { class: 'writing-ready', 'aria-label': 'Готовность участников', hidden: true });
   const columnsEl = h('main', { class: 'columns' });
   const recoveryEl = h('section', { 'aria-label': 'Неотправленные записи' });
   const draftWarningEl = h('div', { class: 'draft-warning', role: 'alert', hidden: true });
@@ -361,6 +345,7 @@ function renderBoardPage(root, id) {
       toolsEl,
     ),
     h('div', { class: 'statusline' }, hintEl, timerEl, statusEl, chainEl),
+    writingEl,
     draftWarningEl,
     recoveryEl,
     columnsEl,
@@ -562,8 +547,10 @@ function renderBoardPage(root, id) {
     if (disposed || next.id !== id) return false;
     if (board && (next.revision ?? 0) < (board.revision ?? 0)) return false;
     if (next.online !== undefined) online = next.online;
+    if (board?.writing?.round !== next.writing?.round) writingNotice = '';
     board = next;
     render();
+    ensureWritingJoined();
     return true;
   }
 
@@ -617,7 +604,99 @@ function renderBoardPage(root, id) {
   }
 
   function canWrite() {
-    return board.phase === 'write' || board.phase === 'reveal';
+    return (board.phase === 'write' && !writingLocked()) || board.phase === 'reveal';
+  }
+
+  function writingLocked() {
+    return board.phase === 'write' && (writingPending || board.writing?.mine);
+  }
+
+  // Состав этапа сохраняется сервером и не зависит от SSE. Повтор входа
+  // после reload/BFCache не добавляет второй голос и не снимает готовность.
+  async function ensureWritingJoined() {
+    const writing = board?.writing;
+    if (disposed || board.phase !== 'write' || !writing || writing.joined
+        || joiningRound !== null || joinFailedRound === writing.round) return;
+    const generation = pageGeneration;
+    const round = writing.round;
+    joiningRound = round;
+    writingNotice = '';
+    renderWritingReady();
+    try {
+      await mutate('POST', `/api/boards/${id}/writing/join`, { round });
+    } catch (err) {
+      if (!isCurrent(generation)) return;
+      joinFailedRound = round;
+      writingNotice = 'Не удалось присоединиться к этапу. Повторите подключение, чтобы учитывалась ваша готовность.';
+      if (err.status === 409) await refreshBoard().catch(() => {});
+    } finally {
+      if (isCurrent(generation)) {
+        joiningRound = null;
+        renderWritingReady();
+        // За время запроса ведущий мог начать новый этап записи.
+        ensureWritingJoined();
+      }
+    }
+  }
+
+  function hasWritingDrafts() {
+    return Object.values(drafts).some(text => text.trim()) || cardEdits.size > 0
+      || pendingCards.size > 0 || unsent.some(entry => entry.path.endsWith('/cards'));
+  }
+
+  async function setWritingReady() {
+    const writing = board?.writing;
+    if (writingPending || board.phase !== 'write' || !writing?.joined) return;
+    const ready = !writing.mine;
+    if (ready && hasWritingDrafts()) {
+      writingNotice = 'Сначала добавьте написанные карточки и сохраните или закройте правки. Неотправленные записи тоже нужно отправить или удалить.';
+      renderWritingReady();
+      return;
+    }
+    const generation = pageGeneration;
+    writingPending = true;
+    writingNotice = '';
+    render();
+    try {
+      await mutate('POST', `/api/boards/${id}/writing/ready`, {
+        ready, round: writing.round, revision: writing.revision,
+      });
+    } catch (err) {
+      if (!isCurrent(generation)) return;
+      writingNotice = 'Не удалось подтвердить готовность. Проверяем состояние доски; при необходимости повторите нажатие.';
+      // Запрос мог сохраниться до обрыва связи; сначала читаем результат.
+      await refreshBoard().catch(() => {});
+      reportError(err);
+    } finally {
+      if (isCurrent(generation)) {
+        writingPending = false;
+        render();
+      }
+    }
+  }
+
+  function renderWritingReady() {
+    const writing = board?.writing;
+    writingEl.hidden = disposed || board?.phase !== 'write' || !writing;
+    if (writingEl.hidden) {
+      writingEl.replaceChildren();
+      return;
+    }
+    writingEl.replaceChildren(
+      h('div', { class: 'writing-ready-copy' },
+        h('strong', { role: 'status' }, `Готовы: ${writing.ready} из ${writing.participants}`),
+        h('p', {}, writing.mine
+          ? 'Вы закончили. Ждём остальных участников.'
+          : 'Когда все нажмут «Я закончил», карточки откроются без ожидания таймера.'),
+        writingNotice ? h('p', { class: 'writing-notice', role: 'alert' }, writingNotice) : null),
+      writing.joined
+        ? h('button', { type: 'button', class: writing.mine ? 'writing-resume' : 'primary',
+          disabled: writingPending, onclick: setWritingReady, dataset: { keep: 'writing-ready' },
+        }, writingPending ? 'Сохраняем…' : writing.mine ? 'Продолжить писать' : 'Я закончил')
+        : h('button', { type: 'button', disabled: joiningRound !== null,
+          onclick: () => { joinFailedRound = null; ensureWritingJoined(); },
+        }, joiningRound !== null ? 'Подключаемся…' : 'Повторить подключение'),
+    );
   }
 
   function focusField(keep) {
@@ -767,14 +846,14 @@ function renderBoardPage(root, id) {
       const next = await boardRequest('POST', `/api/boards/${board.id}/next`, { title });
       if (!isCurrent(generation)) return;
       rememberBoard(next.id, next.title);
-      location.href = '/b/' + next.id;
+      location.href = appPath('/b/' + next.id);
     } catch (err) {
       reportError(err);
     }
   }
 
   async function copyLink() {
-    const url = location.origin + '/b/' + board.id;
+    const url = location.origin + appPath('/b/' + board.id);
     try {
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(url);
@@ -807,6 +886,7 @@ function renderBoardPage(root, id) {
     renderPhases();
     renderChain();
     renderTools();
+    renderWritingReady();
     renderTimer();
     renderColumns();
     columnsEl.scrollLeft = scrollLeft;
@@ -960,7 +1040,7 @@ function renderBoardPage(root, id) {
           }, 'Запустить')));
       }
     }
-    items.push(h('span', { class: 'tool online-count' }, `Онлайн: ${online}`));
+    items.push(h('span', { class: 'tool online-count' }, online < 0 ? 'Подключено' : `Онлайн: ${online}`));
     if (board.phase !== 'write') {
       items.push(h('a', {
         class: 'tool button', href: `/api/boards/${board.id}/export.md`, download: `retro-${board.id}.md`,
@@ -1495,7 +1575,7 @@ function renderBoardPage(root, id) {
     if (editingId === card.id) return renderCardEditor(card);
 
     const editable = canWrite() && (card.mine || board.isOwner);
-    const deletable = (card.mine && canWrite()) || board.isOwner;
+    const deletable = !writingLocked() && ((card.mine && canWrite()) || board.isOwner);
 
     const meta = [h('span', { class: 'author' }, card.author || 'анонимно')];
     if (card.mine) meta.push(h('span', { class: 'mine-badge' }, 'ваша'));
@@ -1624,11 +1704,16 @@ function renderBoardPage(root, id) {
 
   function connect() {
     eventSource?.close();
-    const stream = new EventSource(`/api/boards/${id}/events?participant=${participant}`);
+    const stream = new EventSource(appPath(`/api/boards/${id}/events`));
     eventSource = stream;
     stream.addEventListener('board', e => {
       if (disposed || eventSource !== stream) return;
       const data = JSON.parse(e.data);
+      if (data.participant !== participant) {
+        stream.close();
+        setStatus('Участник изменился. Обновите страницу, чтобы продолжить.');
+        return;
+      }
       stopPolling();
       setStatus('');
       applyBoard(data);
@@ -1659,6 +1744,10 @@ function renderBoardPage(root, id) {
     pendingDone.clear();
     pendingVotes.clear();
     jiraBusy = false;
+    writingPending = false;
+    joiningRound = null;
+    joinFailedRound = null;
+    writingNotice = '';
     jiraChecking.clear();
     actionPending = false;
     pollInFlight = false;
@@ -1683,6 +1772,8 @@ function renderBoardPage(root, id) {
     // вернуть его устаревший текст поверх восстановленного черновика.
     columnsEl.replaceChildren(h('p', { class: 'muted' }, 'Обновляем доску…'));
     toolsEl.replaceChildren();
+    writingEl.replaceChildren();
+    writingEl.hidden = true;
     phaseNav.replaceChildren();
     chainEl.replaceChildren();
     connect();
@@ -1710,11 +1801,12 @@ function renderBoardPage(root, id) {
 // ---------- Маршрутизация ----------
 
 document.addEventListener('DOMContentLoaded', () => {
-  if (identity.warning) document.body.prepend(h('div', {
-    class: 'identity-warning', role: 'alert', dataset: { ui: 'identity-warning' },
-  }, identity.warning));
   const root = document.getElementById('app');
-  const m = location.pathname.match(/^\/b\/([A-Za-z0-9]+)\/?$/);
+  if (!participant) {
+    root.textContent = 'Не удалось открыть сессию Retro. Обновите страницу.';
+    return;
+  }
+  const m = location.pathname.slice(basePath.length).match(/^\/b\/([A-Za-z0-9]+)\/?$/);
   if (m) renderBoardPage(root, m[1]);
   else renderHome(root);
 });

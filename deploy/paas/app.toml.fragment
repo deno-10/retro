@@ -1,0 +1,15 @@
+# Фрагмент для сгенерированного avito service create файла app.toml.
+# Это НЕ готовый app.toml: имя, engine, команда, STaaS и окружения создаются
+# платформой после согласования владельца сервиса. Сохраните их настройки.
+[env_vars]
+RETRO_PROFILE = "paas"
+RETRO_BAAS_SPACE = ""
+RETRO_PUBLIC_ORIGIN = ""
+RETRO_TRUSTED_PROXY = ""
+# Если компонент размещён в корне пространства — пустая строка.
+RETRO_BASE_PATH = ""
+RETRO_SSE_PER_IP = "50"
+RETRO_SSE_PER_BOARD = "50"
+RETRO_SSE_TOTAL = "200"
+# RETRO_DATABASE_URL и JIRA_TOKEN передаются через секреты платформы.
+# Не помещайте их в app.toml, образ или git.

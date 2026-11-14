@@ -50,7 +50,7 @@ func TestNextBoardFailureDoesNotRequireCompensatingWrite(t *testing.T) {
 		}
 	}
 	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
-	h := New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := New(st, hub.New(), static, slog.New(slog.NewTextHandler(io.Discard, nil)), testOptions())
 	rec, _ := do(t, h, "POST", "/api/boards/"+prev.ID+"/next", prev.OwnerID, map[string]any{"title": "Следующее ретро"})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("ошибка хранилища должна вернуть 500: %d %s", rec.Code, rec.Body.String())

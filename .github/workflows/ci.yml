@@ -14,6 +14,17 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: retro_test
+          POSTGRES_PASSWORD: local_test_only
+          POSTGRES_DB: retro_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U retro_test -d retro_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -24,9 +35,13 @@ jobs:
           node-version: '24'
           cache: npm
       - name: Go
+        env:
+          RETRO_TEST_POSTGRES_URL: postgres://retro_test:local_test_only@127.0.0.1:5432/retro_test?sslmode=disable
         run: |
           go test -race ./...
           go vet ./...
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...
       - name: Браузерные регрессии
         run: |
           npm ci
@@ -38,6 +53,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y restic
           docker build --pull -t retro:ci .
+          docker build --pull -f deploy/paas/Dockerfile -t retro:paas-ci .
+          if docker run --rm retro:paas-ci; then
+            echo 'Ошибка: профиль PaaS запустился без конфигурации'
+            exit 1
+          fi
           docker create --name retro-ci-caddy caddy:2.11.9-alpine
           docker cp retro-ci-caddy:/usr/bin/caddy /tmp/retro-ci-caddy
           docker rm retro-ci-caddy
