@@ -43,7 +43,11 @@ func TestClusterSSEAndWriting(t *testing.T) {
 	const owner = "owner-1234"
 	board, _ := model.NewBoard("Общее ретро", "ssc", owner)
 	for i := 1; i < 15; i++ {
-		if _, err := board.JoinWriting(fmt.Sprintf("actor-%04d", i), 1); err != nil {
+		actor := fmt.Sprintf("actor-%04d", i)
+		if _, err := board.AddMember(actor, owner); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := board.JoinWriting(actor, 1); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -72,6 +72,10 @@ func TestGuestSessionBoundary(t *testing.T) {
 	if created.Code != 200 {
 		t.Fatalf("не удалось добавить карточку, HTTP %d", created.Code)
 	}
+	if w := request("GET", path, "", other, ""); w.Code != 404 {
+		t.Fatalf("чужая сессия открыла доску по ссылке, HTTP %d", w.Code)
+	}
+	admitMembers(t, h, board.ID, ownerID, verifyGuest(testSessionKey, other.Value, time.Now()))
 	foreign := request("GET", path, "", other, "")
 	if foreign.Code != 200 || strings.Contains(foreign.Body.String(), "Черновик ведущего") {
 		t.Fatal("участник увидел чужой черновик")

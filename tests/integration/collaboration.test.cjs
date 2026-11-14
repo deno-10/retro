@@ -93,6 +93,13 @@ async function api(method, route, participant, body, key) {
   return { status: response.status, data: await response.json() };
 }
 
+async function admit(id, owner, ...guests) {
+  for (const guest of guests) {
+    const result = await api('POST', `/api/boards/${id}/members`, owner, { participantId: guest.id });
+    assert.equal(result.status, 200);
+  }
+}
+
 async function writingPage(t, id, participant, polling) {
   const context = await browser.newContext();
   t.after(() => context.close());
@@ -105,12 +112,58 @@ async function writingPage(t, id, participant, polling) {
   return page;
 }
 
+test('Пересланная ссылка скрывает доску, историю, события и экспорт до приглашения ведущего', async t => {
+  const f = await fixture();
+  const url = origin + '/b/' + f.id;
+  const path = origin + '/api/boards/' + f.id;
+  const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] });
+  t.after(() => context.close());
+  const stranger = await context.newPage();
+  assert.equal((await stranger.goto(url)).status(), 404);
+  await stranger.getByRole('heading', { name: 'Доска недоступна' }).waitFor();
+  assert.equal(await stranger.getByText(f.board.title, { exact: true }).count(), 0);
+  for (const suffix of ['', '/history', '/events', '/export.md']) {
+    const response = await context.request.get(path + suffix, { timeout: 3000 });
+    assert.equal(response.status(), 404, suffix);
+    assert.doesNotMatch(await response.text(), /Исходное решение/);
+    assert.equal(response.headers()['content-disposition'], undefined);
+  }
+  await stranger.getByRole('button', { name: 'Скопировать мой ID' }).click();
+  const copied = await stranger.evaluate(() => navigator.clipboard.readText());
+  assert.equal(copied, await stranger.locator('meta[name="retro-participant"]').getAttribute('content'));
+
+  const leader = await pageFor(t, f, f.owner);
+  leader.once('dialog', dialog => dialog.accept(copied));
+  await leader.getByRole('button', { name: 'Добавить участника' }).click();
+  await leader.getByText('Доступ открыт.', { exact: false }).waitFor();
+  assert.equal((await stranger.reload()).status(), 200);
+  await stranger.getByText('Исходное решение', { exact: true }).waitFor();
+  assert.equal(await stranger.getByRole('button', { name: 'Добавить участника' }).count(), 0);
+  const history = await context.request.get(path + '/history');
+  assert.deepEqual((await history.json()).map(item => item.id), [f.id]);
+  const exported = await context.request.get(path + '/export.md');
+  assert.equal(exported.status(), 200);
+  assert.match(exported.headers()['content-disposition'], /attachment/);
+  assert.match(await exported.text(), /Исходное решение/);
+
+  await stranger.goto(origin + '/');
+  await stranger.getByRole('link', { name: f.board.title, exact: true }).waitFor();
+  await context.clearCookies();
+  await traverseHistory(stranger, 'goBack', '/b/' + f.id);
+  await stranger.getByRole('heading', { name: 'Доска недоступна' }).waitFor();
+  assert.equal(await stranger.getByText('Исходное решение', { exact: true }).count(), 0);
+  await traverseHistory(stranger, 'goForward', '/');
+  await stranger.getByRole('button', { name: 'Создать доску' }).waitFor();
+  assert.equal(await stranger.getByRole('link', { name: f.board.title, exact: true }).count(), 0);
+});
+
 for (const polling of [false, true]) test(`Готовность с настоящим ${polling ? 'опросом без SSE' : 'SSE'}: все участники открывают карточки до таймера`, async t => {
   const [owner, author, third] = await Promise.all([openGuest(origin), openGuest(origin), openGuest(origin)]);
   const created = await api('POST', '/api/boards', owner, { title: 'Готовность команды' });
   assert.equal(created.status, 201);
   const id = created.data.id;
   const route = `/api/boards/${id}`;
+  await admit(id, owner, author, third);
   assert.equal((await api('POST', route + '/timer', owner, { minutes: 5 })).status, 200);
   const leaderPage = await writingPage(t, id, owner, polling);
   const authorPage = await writingPage(t, id, author, polling);
@@ -149,6 +202,7 @@ test('Готовность: повтор этапа сбрасывает отм�
   const [owner, author] = await Promise.all([openGuest(origin), openGuest(origin)]);
   const { data: board } = await api('POST', '/api/boards', owner, { title: 'Новый этап записи' });
   const route = `/api/boards/${board.id}`;
+  await admit(board.id, owner, author);
   const leaderPage = await writingPage(t, board.id, owner, false);
   const authorPage = await writingPage(t, board.id, author, false);
   await leaderPage.getByText('Готовы: 0 из 2', { exact: true }).waitFor();
@@ -176,6 +230,7 @@ async function fixture() {
   const created = await api('POST', '/api/boards', owner, { title: `Интеграция ${token()}`, template: 'classic' });
   assert.equal(created.status, 201);
   const id = created.data.id;
+  await admit(id, owner, author);
   assert.equal((await api('POST', `/api/boards/${id}/phase`, owner, { phase: 'reveal' })).status, 200);
   const added = await api('POST', `/api/boards/${id}/actions`, author,
     { text: 'Исходное решение', assignee: 'Анна' }, token());

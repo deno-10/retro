@@ -161,6 +161,8 @@ input:focus, select:focus, textarea:focus {
 .create button:hover:not(:disabled) { background: #d1ffa5; }
 .create .button-arrow { width: 34px; height: 34px; background: var(--ink); color: white; }
 .form-note { text-align: center; margin: -6px 0 0; font-size: 11px; line-height: 1.6; color: #bcbcc0; }
+.clipboard-field { position: fixed; left: -9999px; }
+.access-status { margin: 15vh auto; text-align: center; color: var(--muted); }
 .how-it-works { grid-column: 1 / -1; scroll-margin-top: 32px; }
 .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 40px; margin-bottom: 28px; }
 .section-heading h2 { font-size: 44px; line-height: 1.08; font-weight: 800; letter-spacing: -.055em; }

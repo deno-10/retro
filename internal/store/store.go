@@ -24,6 +24,8 @@ type Store interface {
 	// CreateNext атомарно создаёт следующее ретро и связывает обе доски.
 	CreateNext(prevID, title, actorID string) (*model.Board, error)
 	Get(id string) (*model.Board, error)
+	// GetForMember возвращает ErrNotFound и для чужой, и для отсутствующей доски.
+	GetForMember(id, participant string) (*model.Board, error)
 	Update(id string, fn func(b *model.Board) error) (*model.Board, error)
 	Close() error
 }
@@ -142,6 +144,16 @@ func (s *JSONStore) Get(id string) (*model.Board, error) {
 	defer s.mu.RUnlock()
 	b, ok := s.boards[id]
 	if !ok {
+		return nil, model.ErrNotFound
+	}
+	return clone(b)
+}
+
+func (s *JSONStore) GetForMember(id, participant string) (*model.Board, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, ok := s.boards[id]
+	if !ok || !b.HasMember(participant) {
 		return nil, model.ErrNotFound
 	}
 	return clone(b)

@@ -219,11 +219,13 @@ func TestJiraValidationAndDefiniteFailureRetry(t *testing.T) {
 	})
 	h := jiraHandler(t, st, client)
 	endpoint := "/api/boards/" + b.ID + "/actions/" + b.Actions[0].ID + "/jira"
+	admitMembers(t, h, b.ID, jiraOwner, "other-00000001")
 	for _, tc := range []struct {
 		actor   string
 		payload any
 		code    int
 	}{
+		{"outsider-00001", map[string]int{"revision": 1}, 404},
 		{"other-00000001", map[string]int{"revision": 1}, 403},
 		{jiraOwner, map[string]int{"revision": 0}, 409},
 		{jiraOwner, map[string]any{}, 400},

@@ -153,8 +153,12 @@ func pgRead(ctx context.Context, q interface {
 	if lock {
 		query += " FOR UPDATE"
 	}
+	return scanPostgresBoard(q.QueryRowContext(ctx, query, id))
+}
+
+func scanPostgresBoard(row *sql.Row) (*model.Board, error) {
 	var data string
-	err := q.QueryRowContext(ctx, query, id).Scan(&data)
+	err := row.Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, model.ErrNotFound
 	}
@@ -168,6 +172,13 @@ func (s *PostgresStore) Get(id string) (*model.Board, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), postgresTimeout)
 	defer cancel()
 	return pgRead(ctx, s.db, id, false)
+}
+
+func (s *PostgresStore) GetForMember(id, participant string) (*model.Board, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), postgresTimeout)
+	defer cancel()
+	return scanPostgresBoard(s.db.QueryRowContext(ctx, `SELECT data FROM retro_boards
+		WHERE id=$1 AND $2 <> '' AND (data->>'ownerId'=$2 OR (data->'members') ? $2)`, id, participant))
 }
 
 func pgSave(ctx context.Context, tx *sql.Tx, id string, b *model.Board) error {

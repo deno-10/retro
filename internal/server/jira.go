@@ -12,6 +12,16 @@ import (
 
 func (s *Server) view(b *model.Board, pid string) model.BoardView {
 	v := b.View(pid)
+	// Каждое ретро имеет собственный состав, в том числе после переноса досок.
+	visibleLink := func(id string) string {
+		if id != "" {
+			if _, err := s.store.GetForMember(id, pid); err != nil {
+				return ""
+			}
+		}
+		return id
+	}
+	v.PrevID, v.NextID = visibleLink(v.PrevID), visibleLink(v.NextID)
 	if c := s.options.Jira; c != nil {
 		v.Jira = &model.JiraConfigView{Project: c.Project(), IssueType: c.IssueType()}
 	}
@@ -43,6 +53,10 @@ func (s *Server) handleCreateJira(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Revision == nil {
 		s.writeErr(w, fmt.Errorf("%w: укажите версию выбранного решения", model.ErrInvalid))
+		return
+	}
+	if _, err := s.store.GetForMember(r.PathValue("id"), participant(r)); err != nil {
+		s.writeErr(w, err)
 		return
 	}
 	if !s.jiraSlot(w) {
@@ -101,16 +115,16 @@ func (s *Server) handleCheckJira(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	if !s.jiraSlot(w) {
-		return
-	}
-	defer func() { <-s.jiraSlots }()
 	pid := participant(r)
-	b, err := s.store.Get(r.PathValue("id"))
+	b, err := s.store.GetForMember(r.PathValue("id"), pid)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	if !s.jiraSlot(w) {
+		return
+	}
+	defer func() { <-s.jiraSlots }()
 	c := s.options.Jira
 	actionID := r.PathValue("actionId")
 	link, err := b.JiraForCheck(actionID, pid, c.Target())

@@ -107,9 +107,20 @@ test('BaaS: префикс, стабильная личность, SSE, смен
     return response.status;
   }, { prefix, id, aliceID, columnId: created.body.columns[0].id });
   assert.equal(rejected, 409);
-  await page.reload();
+  assert.equal((await page.reload()).status(), 404);
+  await page.getByRole('heading', { name: 'Доска недоступна' }).waitFor();
+  const bobID = await page.locator('meta[name="retro-participant"]').getAttribute('content');
+  assert.notEqual(bobID, aliceID);
+  for (const suffix of ['', '/history', '/export.md', '/events']) {
+    const denied = await context.request.get(origin + prefix + '/api/boards/' + id + suffix, { timeout: 3000 });
+    assert.equal(denied.status(), 404, suffix);
+    assert.doesNotMatch(await denied.text(), /Корпоративное ретро|Личный черновик Алисы/);
+  }
+  sameUser.once('dialog', dialog => dialog.accept(bobID));
+  await sameUser.getByRole('button', { name: 'Добавить участника' }).click();
+  await sameUser.getByText('Доступ открыт.', { exact: false }).waitFor();
+  assert.equal((await page.reload()).status(), 200);
   await page.getByRole('button', { name: 'Я закончил', exact: true }).waitFor();
-  assert.notEqual(await page.locator('meta[name="retro-participant"]').getAttribute('content'), aliceID);
   assert.equal(await page.getByPlaceholder('Новая карточка').first().inputValue(), '');
   assert.equal(await page.getByText('Несохранённый текст Алисы', { exact: true }).count(), 0);
   await context.addCookies([{ name: 'retro-test-user', value: 'alice', url: origin }]);

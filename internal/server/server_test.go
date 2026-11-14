@@ -63,6 +63,14 @@ func firstCard(t *testing.T, view map[string]any) map[string]any {
 	return cards[0].(map[string]any)
 }
 
+func admitMembers(t *testing.T, h http.Handler, id, owner string, members ...string) {
+	t.Helper()
+	for _, member := range members {
+		rec, _ := do(t, h, "POST", "/api/boards/"+id+"/members", owner, map[string]string{"participantId": member})
+		requireMutationStatus(t, rec, http.StatusOK)
+	}
+}
+
 func TestBoardFlow(t *testing.T) {
 	h := newTestServer(t)
 	const owner, alice, bob = "owner-00000001", "alice-00000001", "bob-0000000001"
@@ -76,6 +84,7 @@ func TestBoardFlow(t *testing.T) {
 	if out["isOwner"] != true {
 		t.Fatal("создатель должен быть ведущим")
 	}
+	admitMembers(t, h, id, owner, alice, bob)
 
 	rec, _ = do(t, h, "POST", "/api/boards/"+id+"/cards", alice,
 		map[string]any{"columnId": colID, "text": "деплой по пятницам", "author": "Алиса"})
@@ -123,6 +132,7 @@ func TestNextBoardAndHistory(t *testing.T) {
 
 	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Спринт 1", "template": "4l"})
 	first := out["id"].(string)
+	admitMembers(t, h, first, owner, alice)
 	do(t, h, "POST", "/api/boards/"+first+"/phase", owner, map[string]any{"phase": "discuss"})
 	do(t, h, "POST", "/api/boards/"+first+"/actions", alice, map[string]any{"text": "Открытое", "assignee": "Боб"})
 	_, out = do(t, h, "POST", "/api/boards/"+first+"/actions", alice, map[string]any{"text": "Закрытое"})
@@ -175,6 +185,7 @@ func TestGroupEndpoints(t *testing.T) {
 
 	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Группы", "template": "classic"})
 	id := out["id"].(string)
+	admitMembers(t, h, id, owner, alice)
 	colID := out["columns"].([]any)[0].(map[string]any)["id"].(string)
 	var ids []string
 	for _, text := range []string{"первая", "вторая"} {
@@ -215,6 +226,7 @@ func TestActionsFlow(t *testing.T) {
 
 	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Решения", "template": "classic"})
 	id := out["id"].(string)
+	admitMembers(t, h, id, owner, alice, bob)
 
 	rec, _ := do(t, h, "POST", "/api/boards/"+id+"/actions", alice, map[string]any{"text": "рано"})
 	if rec.Code != http.StatusConflict {
@@ -279,8 +291,9 @@ func TestTimerAutoAdvance(t *testing.T) {
 	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Таймер", "template": "classic"})
 	id := out["id"].(string)
 
+	admitMembers(t, h, id, owner, bob)
 	// Истёкший таймер (например, после рестарта сервера) применяется при
-	// первом же чтении доски: запись → показ, таймер снят.
+	// первом же чтении участником: запись → показ, таймер снят.
 	setTimerEnd(t, st, id, time.Now().Add(-time.Minute))
 	_, out = do(t, h, "GET", "/api/boards/"+id, bob, nil)
 	if out["phase"] != "reveal" || out["timerEndsAt"] != nil {
@@ -327,6 +340,7 @@ func TestTimerEndpoint(t *testing.T) {
 	_, out := do(t, h, "POST", "/api/boards", owner, map[string]any{"title": "Таймер", "template": "classic"})
 	id := out["id"].(string)
 
+	admitMembers(t, h, id, owner, bob)
 	rec, _ := do(t, h, "POST", "/api/boards/"+id+"/timer", bob, map[string]any{"minutes": 5})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("таймер не ведущим: %d", rec.Code)
